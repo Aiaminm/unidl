@@ -94,6 +94,7 @@ from .live_rules import (
 from .loader import LoadError, normalize_headers
 from .models import SegmentInfo
 from .mux_audio import normalize_default_audio, resolve_default_audio
+from .mux_subtitle import normalize_default_subtitle, resolve_default_subtitle
 from .parser import parse_source
 from .postprocess import (
     MuxInput,
@@ -408,6 +409,7 @@ def _build_parser(
     g_mux.add_argument("--chapters-file", help="Read a UniDL JSON chapter sidecar and embed it in the final audio or video container.")
     g_mux.add_argument("--muxer", choices=["auto", "ffmpeg", "mkvmerge"], default="auto")
     g_mux.add_argument("--default-audio", type=normalize_default_audio, default="auto", help="Default muxed audio: auto, original, or one language tag. Only selected tracks are considered.")
+    g_mux.add_argument("--default-subtitle", type=normalize_default_subtitle, default="auto", help="Default muxed subtitle: auto, original, or one language tag. Only selected tracks are considered.")
     g_mux.add_argument("--mux-format", choices=["mkv", "mp4", "ts"], help="Final mux container. Defaults to mkv for VOD and ts for live.")
     g_net.add_argument("--custom-range", help="Only download selected media segment range, e.g. 1-100,120-160.")
     g_crypt.add_argument("--custom-hls-method", choices=["AES_128", "AES_128_ECB", "BBTS", "CENC", "CHACHA20", "NONE", "SAMPLE_AES", "SAMPLE_AES_CTR", "UNKNOWN"])
@@ -993,13 +995,18 @@ def _download(args: argparse.Namespace) -> int:
                 )
                 with task_line.spinning("Muxing {spinner}"):
                     muxed = mux_files(
-                        _mux_inputs_for_tracks(live_mux_tracks, getattr(args, "default_audio", "auto")),
+                        _mux_inputs_for_tracks(
+                            live_mux_tracks,
+                            getattr(args, "default_audio", "auto"),
+                            getattr(args, "default_subtitle", "auto"),
+                        ),
                         mux_output,
                         muxer=_muxer_for_tracks(live_mux_tracks, args, live=True),
                         imports=mux_imports,
                         chapters_file=getattr(args, "chapters_file", None),
                         force_vvc_mp4=False,
                         default_audio=getattr(args, "default_audio", "auto"),
+                        default_subtitle=getattr(args, "default_subtitle", "auto"),
                     )
                 task_line.update("Muxed ✓", done=True)
                 _log_line(args, f"Muxed: {muxed}")
@@ -1019,6 +1026,7 @@ def _download(args: argparse.Namespace) -> int:
                         muxer=args.muxer,
                         imports=mux_imports,
                         chapters_file=getattr(args, "chapters_file", None),
+                        default_subtitle=getattr(args, "default_subtitle", "auto"),
                     )
                 task_line.update("Muxed ✓", done=True)
                 _log_line(args, f"Muxed: {muxed}")
@@ -1148,13 +1156,18 @@ def _download(args: argparse.Namespace) -> int:
         )
         with task_line.spinning("Muxing {spinner}"):
             muxed = mux_files(
-                _mux_inputs_for_tracks(downloaded_tracks, getattr(args, "default_audio", "auto")),
+                _mux_inputs_for_tracks(
+                    downloaded_tracks,
+                    getattr(args, "default_audio", "auto"),
+                    getattr(args, "default_subtitle", "auto"),
+                ),
                 mux_output,
                 muxer=_muxer_for_tracks(downloaded_tracks, args, live=False),
                 imports=mux_imports,
                 chapters_file=getattr(args, "chapters_file", None),
                 force_vvc_mp4=True,
                 default_audio=getattr(args, "default_audio", "auto"),
+                default_subtitle=getattr(args, "default_subtitle", "auto"),
             )
         task_line.update("Muxed ✓", done=True)
         _log_line(args, f"Muxed: {muxed}")
@@ -8459,7 +8472,11 @@ def _live_mux_tracks(tracks: list[_DownloadedTrack], args: argparse.Namespace) -
     return tracks
 
 
-def _mux_inputs_for_tracks(tracks: list[_DownloadedTrack], default_audio: str = "auto") -> list[MuxInput]:
+def _mux_inputs_for_tracks(
+    tracks: list[_DownloadedTrack],
+    default_audio: str = "auto",
+    default_subtitle: str | None = "auto",
+) -> list[MuxInput]:
     tracks = [track for track in tracks if not _empty_subtitle_track(track)]
     selected_streams = [track.stream for track in tracks]
     starts = [_dash_mux_start(track.stream) for track in tracks]
@@ -8475,8 +8492,27 @@ def _mux_inputs_for_tracks(tracks: list[_DownloadedTrack], default_audio: str = 
         for track, start in zip(tracks, starts, strict=False)
     ]
     choice = resolve_default_audio(selected_streams, default_audio)
+    subtitle_choice = (
+        resolve_default_subtitle(selected_streams, default_subtitle)
+        if default_subtitle is not None
+        else None
+    )
     return [
-        replace(item, default=track.stream is choice.stream) if track.stream.media_type == "audio" else item
+        replace(
+            item,
+            default=(
+                track.stream is choice.stream
+                if track.stream.media_type == "audio"
+                else (
+                    track.stream is subtitle_choice.stream
+                    if subtitle_choice is not None
+                    and track.stream.media_type in {"subtitle", "subtitles", "text"}
+                    else item.default
+                )
+            ),
+        )
+        if track.stream.media_type in {"audio", "subtitle", "subtitles", "text"}
+        else item
         for item, track in zip(inputs, tracks, strict=True)
     ]
 
@@ -8508,6 +8544,17 @@ def _mux_input_for_track(
         media_type=getattr(stream, "media_type", None),
         track_type_filter=iqiyi_separate_audio_mux_media_type(stream, selected_streams),
         codecs=getattr(stream, "codecs", None),
+        kind=(
+            str(stream.extra.get("subtitle_kind") or stream.group_id or "normal")
+            if stream.media_type in {"subtitle", "subtitles", "text"}
+            else None
+        ),
+        original=(
+            bool(stream.extra.get("subtitle_original"))
+            or "original" in str(stream.role or stream.name or "").casefold()
+            if stream.media_type in {"subtitle", "subtitles", "text"}
+            else False
+        ),
     )
 
 

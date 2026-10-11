@@ -561,7 +561,40 @@ AttachmentsScreen {
 #attachment-modal-close:hover { background: $highlight; color: $foreground; }
 #attachment-summary, #attachment-info { height: auto; padding: 1 2 0 2; color: $muted; text-align: center; }
 #attachment-image { width: 1fr; height: 1fr; min-height: 8; max-height: 28; content-align: center middle; padding: 1; }
-#attachment-modal-hint { height: 1; padding: 1 2 0 2; color: $muted; text-align: center; }
+#attachment-modal-hint { height: 1; padding: 0 2; color: $muted; text-align: center; }
+#attachment-modal-nav, #chapter-modal-nav, #lyrics-modal-nav {
+    width: 1fr;
+    height: 1;
+    margin: 1 0;
+    padding: 0 2;
+    align: center middle;
+}
+#attachment-modal-nav Button, #chapter-modal-nav Button, #lyrics-modal-nav Button {
+    width: auto;
+    min-width: 0;
+    height: 1;
+    padding: 0 1;
+    margin: 0 1;
+    border: none;
+    background: transparent;
+    background-tint: transparent;
+    color: $accent;
+    text-style: none;
+}
+#attachment-modal-nav Button:hover, #chapter-modal-nav Button:hover, #lyrics-modal-nav Button:hover {
+    border: none;
+    background: $highlight;
+    color: $foreground;
+}
+#attachment-modal-nav Button:focus, #chapter-modal-nav Button:focus, #lyrics-modal-nav Button:focus {
+    text-style: underline;
+}
+#attachment-modal-nav Button:disabled, #chapter-modal-nav Button:disabled, #lyrics-modal-nav Button:disabled {
+    border: none;
+    background: transparent;
+    color: $muted;
+    text-style: none;
+}
 .ask-title-row {
     height: 1;
     width: 1fr;
@@ -2369,6 +2402,29 @@ ModalScreen.editor {
 
    Air is a luxury; the list is the screen. Same rule as the status line and the
    key bar: lose the least important thing whole. */
+/* Keep metadata navigation visible in short terminals. */
+.short #attachment-modal {
+    height: 86%;
+}
+.short #attachment-summary, .short #attachment-info {
+    height: 1;
+    padding: 0 1;
+    overflow: hidden;
+}
+.short #attachment-image {
+    min-height: 1;
+    padding: 0;
+}
+.short #attachment-modal-nav, .short #chapter-modal-nav, .short #lyrics-modal-nav {
+    margin: 0;
+    padding: 0 1;
+}
+.short #chapter-summary, .short #lyrics-summary {
+    padding: 0 1;
+}
+.short #chapter-modal, .short #lyrics-modal {
+    padding: 0 1;
+}
 .short #prompt-hint {
     height: 1;
     padding: 0 1;

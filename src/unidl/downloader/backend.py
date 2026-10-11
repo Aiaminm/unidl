@@ -859,6 +859,7 @@ class NativeDownloaderBackend:
             mux_format=mux_format,
             muxer=muxer,
             default_audio=policy.default_audio,
+            default_subtitle=policy.default_subtitle,
             mux_imports=list(policy.mux_imports),
             chapters_file=(
                 str(policy.chapters_file) if policy.chapters_file else None

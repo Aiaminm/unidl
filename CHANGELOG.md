@@ -1,5 +1,19 @@
 # Changelog
 
+## [2.3.7] - 2026-10-11
+
+### Batch downloads
+
+- Added optional fixed or random delays between automatically queued titles, with responsive pause, resume and cancellation controls.
+
+### Metadata windows
+
+- Added clickable Previous/Next controls to attachment, chapter and lyrics windows alongside keyboard navigation, including compact layouts for short terminals.
+
+### Default subtitles
+
+- Added a default subtitle language preference for muxed output, including selected-track matching, sidecar subtitles, fallback notices and import/export persistence.
+
 ## [2.3.6] - 2026-10-09
 
 ### BBC playback

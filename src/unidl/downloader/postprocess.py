@@ -50,6 +50,8 @@ class MuxInput:
     media_type: str | None = None
     track_type_filter: str | None = None
     codecs: str | None = None
+    kind: str | None = None
+    original: bool = False
 
 
 def parse_keys(values: list[str] | None) -> list[RawKey]:
@@ -103,6 +105,8 @@ def parse_mux_import(value: str) -> MuxInput:
         name=options.get("name") or options.get("title"),
         default=_bool_option(options.get("default")),
         forced=_bool_option(options.get("forced")),
+        kind=options.get("kind") or options.get("subtitle_kind"),
+        original=bool(_bool_option(options.get("original"))),
     )
 
 
@@ -722,6 +726,7 @@ def mux_files(
     *,
     force_vvc_mp4: bool = True,
     default_audio: str | None = None,
+    default_subtitle: str | None = None,
 ) -> Path:
     primary = [_coerce_mux_input(item) for item in inputs]
     imported = imports or []
@@ -789,6 +794,11 @@ def mux_files(
                 _mux_audio_layout(prepared_inputs, selected, executable, default_audio)
                 if default_audio is not None else ([], None, [])
             )
+            subtitle_layout, chosen_subtitle = (
+                _mux_subtitle_layout(prepared_inputs, selected, executable, default_subtitle)
+                if default_subtitle is not None else ([], None)
+            )
+            subtitle_sources = {source_index for source_index, _track_id, _stream in subtitle_layout}
             for input_index, item in enumerate(prepared_inputs):
                 flags = []
                 for source_index, track_id, stream in audio_layout:
@@ -798,9 +808,21 @@ def mux_files(
                             flags.extend(["--language", f"{track_id}:{item.language}"])
                         if item.name:
                             flags.extend(["--track-name", f"{track_id}:{item.name}"])
+                for source_index, track_id, stream in subtitle_layout:
+                    if source_index == input_index:
+                        flags.extend(["--default-track-flag", f"{track_id}:{'yes' if stream is chosen_subtitle else 'no'}"])
+                        flags.extend(["--forced-track", f"{track_id}:{'yes' if stream.extra.get('forced') else 'no'}"])
+                        if item.language:
+                            flags.extend(["--language", f"{track_id}:{item.language}"])
+                        if item.name:
+                            flags.extend(["--track-name", f"{track_id}:{item.name}"])
                 metadata_item = (
-                    replace(item, default=None, language=None, name=None)
-                    if default_audio is not None and item.media_type == "audio" else item
+                    replace(item, default=None, forced=None, language=None, name=None)
+                    if (
+                        (default_audio is not None and item.media_type == "audio")
+                        or (default_subtitle is not None and input_index in subtitle_sources)
+                    )
+                    else item
                 )
                 imported_args = _mkvmerge_import_args(metadata_item)
                 args.extend([*imported_args[:-1], *flags, imported_args[-1]])
@@ -824,13 +846,35 @@ def mux_files(
                 args.extend(["-f", "ffmetadata", "-i", str(chapter_path)])
             for index, item in enumerate(prepared_inputs):
                 args.extend(["-map", _ffmpeg_mux_map_spec(index, item)])
-            if default_audio is not None and output.suffix.lower() not in {".ts", ".m2ts"}:
-                audio_layout, chosen_audio, mapped = _mux_audio_layout(prepared_inputs, selected, executable, default_audio)
+            subtitle_layout, chosen_subtitle = (
+                _mux_subtitle_layout(prepared_inputs, selected, executable, default_subtitle)
+                if default_subtitle is not None else ([], None)
+            )
+            subtitle_sources = {source_index for source_index, _track_id, _stream in subtitle_layout}
+            if (default_audio is not None or default_subtitle is not None) and output.suffix.lower() not in {".ts", ".m2ts"}:
+                # Probe every input to build the same output-stream map used
+                # by the audio path.  A one-entry-per-input fallback is wrong
+                # for a container carrying several streams (and shifts the
+                # subtitle disposition indexes).
+                audio_layout, chosen_audio, mapped = _mux_audio_layout(
+                    prepared_inputs,
+                    selected,
+                    executable,
+                    default_audio if default_audio is not None else "auto",
+                )
                 for output_index, (input_index, media_type) in enumerate(mapped):
                     item = prepared_inputs[input_index]
                     if item.media_type in {None, media_type, "subtitles", "text"}:
-                        args.extend(_ffmpeg_import_metadata_args(output_index, item))
-                args.extend(_ffmpeg_default_audio_args(audio_layout, chosen_audio))
+                        metadata_item = (
+                            replace(item, default=None, forced=None, language=None, name=None)
+                            if input_index in subtitle_sources
+                            else item
+                        )
+                        args.extend(_ffmpeg_import_metadata_args(output_index, metadata_item))
+                if default_audio is not None:
+                    args.extend(_ffmpeg_default_audio_args(audio_layout, chosen_audio))
+                if default_subtitle is not None:
+                    args.extend(_ffmpeg_default_subtitle_args(subtitle_layout, chosen_subtitle))
             else:
                 for index, item in enumerate(prepared_inputs):
                     args.extend(_ffmpeg_import_metadata_args(index, item))
@@ -895,6 +939,7 @@ def _probe_mux_tracks(item: MuxInput, muxer: str, executable: str) -> list[dict]
                 "language": (track.get("tags") or {}).get("language"),
                 "track_name": (track.get("tags") or {}).get("title"),
                 "default_track": (track.get("disposition") or {}).get("default"),
+                "forced_track": (track.get("disposition") or {}).get("forced"),
                 "audio_channels": track.get("channels"), "bit_rate": track.get("bit_rate"),
             },
         }
@@ -939,6 +984,41 @@ def _mux_audio_layout(inputs: list[MuxInput], muxer: str, executable: str, prefe
     return layout, choice.stream, mapped
 
 
+def _mux_subtitle_layout(inputs: list[MuxInput], muxer: str, executable: str, preference: str):
+    """Resolve one default subtitle from the subtitle tracks in mux inputs."""
+    from .models import StreamInfo
+    from .mux_subtitle import resolve_default_subtitle
+
+    layout = []
+    for input_index, item in enumerate(inputs):
+        for track in _probe_mux_tracks(item, muxer, executable):
+            media_type = track.get("type")
+            if media_type not in {"subtitle", "subtitles", "text"}:
+                continue
+            properties = track.get("properties") or {}
+            stream = StreamInfo(
+                manifest_type="file",
+                media_type="subtitle",
+                language=item.language or properties.get("language"),
+                name=item.name or properties.get("track_name"),
+                codecs=item.codecs or track.get("codec"),
+                role=item.kind,
+                group_id=item.kind,
+                extra={
+                    "default": item.default if item.default is not None else properties.get("default_track"),
+                    "forced": item.forced if item.forced is not None else properties.get("forced_track"),
+                    "subtitle_kind": item.kind or "normal",
+                    "subtitle_original": item.original,
+                },
+            )
+            layout.append((input_index, int(track["id"]), stream))
+    choice = resolve_default_subtitle(
+        [stream for _, _, stream in layout],
+        preference,
+    )
+    return layout, choice.stream
+
+
 def _ffmpeg_default_audio_args(layout, chosen) -> list[str]:
     args = []
     for audio_index, (_, _, stream) in enumerate(layout):
@@ -949,6 +1029,24 @@ def _ffmpeg_default_audio_args(layout, chosen) -> list[str]:
             args.extend([f"-metadata:s:a:{audio_index}", f"language={stream.language}"])
         if stream.name:
             args.extend([f"-metadata:s:a:{audio_index}", f"title={stream.name}"])
+    return args
+
+
+def _ffmpeg_default_subtitle_args(layout, chosen) -> list[str]:
+    args = []
+    for subtitle_index, (_, _, stream) in enumerate(layout):
+        dispositions = []
+        if stream is chosen:
+            dispositions.append("default")
+        if stream.extra.get("forced"):
+            dispositions.append("forced")
+        args.extend([
+            f"-disposition:s:{subtitle_index}", "+".join(dispositions) if dispositions else "0",
+        ])
+        if stream.language:
+            args.extend([f"-metadata:s:s:{subtitle_index}", f"language={stream.language}"])
+        if stream.name:
+            args.extend([f"-metadata:s:s:{subtitle_index}", f"title={stream.name}"])
     return args
 
 
@@ -1118,7 +1216,7 @@ def _looks_like_mux_separator(value: str, current_length: int, separator: str) -
     if position >= len(value) or value[position] != separator:
         return False
     rest = value[position + 1 :].lstrip()
-    return bool(re.match(r"(path|file|input|lang|language|name|title|default|forced)=", rest, flags=re.IGNORECASE))
+    return bool(re.match(r"(path|file|input|lang|language|name|title|default|forced|kind|subtitle_kind|original)=", rest, flags=re.IGNORECASE))
 
 
 def _bool_option(value: str | None) -> bool | None:

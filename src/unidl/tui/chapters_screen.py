@@ -8,7 +8,7 @@ from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen
-from textual.widgets import Static
+from textual.widgets import Button, Static
 
 from ..core.chapters import Chapter, count_label, length, summary, timestamp
 from ..core.i18n import tr
@@ -70,6 +70,9 @@ class ChaptersScreen(ModalScreen[None]):
                         f"     {visual_markup(chapter.title)}",
                         classes=f"chapter-row {'odd' if index % 2 else 'even'}",
                     )
+            with Horizontal(id="chapter-modal-nav"):
+                yield Button(f"‹ {tr('modal.previous')}", id="chapter-previous")
+                yield Button(f"{tr('modal.next')} ›", id="chapter-next")
             yield Static(
                 f"[$muted]{tr('chapters.close_hint', summary=count_label(self.chapters))}[/]",
                 id="chapter-modal-hint",
@@ -90,6 +93,19 @@ class ChaptersScreen(ModalScreen[None]):
             listing.scroll_home(animate=False)
         else:
             listing.scroll_end(animate=False)
+
+    def action_previous(self) -> None:
+        self.action_scroll(-12)
+
+    def action_next(self) -> None:
+        self.action_scroll(12)
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        event.stop()
+        if event.button.id == "chapter-previous":
+            self.action_previous()
+        elif event.button.id == "chapter-next":
+            self.action_next()
 
     def action_close(self) -> None:
         self.dismiss(None)

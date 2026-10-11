@@ -129,10 +129,21 @@ class SettingsGroupScreen(Screen[None]):
 
         # Reuse the established editors so choice rows keep the same keyboard and
         # focus semantics as the ordinary Settings screen.
-        from .settings_screen import _ChoiceEditor, _DefaultAudioEditor, _MultiChoiceEditor, _TextEditor
+        from .settings_screen import (
+            _ChoiceEditor,
+            _DefaultAudioEditor,
+            _DefaultSubtitleEditor,
+            _MultiChoiceEditor,
+            _TextEditor,
+            _TitleDelayEditor,
+        )
 
-        if spec.key == "default_audio":
+        if spec.key == "title_delay":
+            editor = _TitleDelayEditor(spec, self.scope.get(spec.key))
+        elif spec.key == "default_audio":
             editor = _DefaultAudioEditor(spec, self.scope.get(spec.key))
+        elif spec.key == "default_subtitle":
+            editor = _DefaultSubtitleEditor(spec, self.scope.get(spec.key))
         elif spec.kind == "multi":
             editor = _MultiChoiceEditor(spec, self.scope.get(spec.key))
         elif spec.kind == "choice":

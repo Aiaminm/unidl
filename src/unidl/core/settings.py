@@ -69,10 +69,22 @@ class Setting:
         return [o.display() for o in self.options]
 
     def coerce(self, value: Any) -> Any:
-        if self.key == "default_audio":
-            from ..downloader.mux_audio import normalize_default_audio
+        if self.key == "title_delay":
+            from .title_delay import normalize_title_delay
 
-            return normalize_default_audio(value)
+            try:
+                return normalize_title_delay(value)
+            except ValueError:
+                return normalize_title_delay(self.default)
+        if self.key in {"default_audio", "default_subtitle"}:
+            from ..downloader.mux_audio import normalize_default_audio
+            from ..downloader.mux_subtitle import normalize_default_subtitle
+
+            return (
+                normalize_default_audio(value)
+                if self.key == "default_audio"
+                else normalize_default_subtitle(value)
+            )
         if self.kind == "bool":
             if isinstance(value, str):
                 return value.strip().lower() in {"1", "true", "yes", "on"}
@@ -978,6 +990,18 @@ GLOBAL_SETTINGS: list[Setting] = [
         help="Cap segment download speed, e.g. 15M, 100K, 2Mbps. Empty means unlimited.",
         visible=False,
     ),
+    Setting(
+        "title_delay",
+        "Delay between titles",
+        "text",
+        default="off",
+        help=(
+            "Optional batch-only delay before the next title starts. Use off, a fixed number "
+            "of seconds, or MIN-MAX such as 20-40. It never delays tracks within one title "
+            "or live recording segments."
+        ),
+        visible=False,
+    ),
     _choice(
         "muxer",
         "Muxer",
@@ -1302,6 +1326,14 @@ TRACK_SETTINGS: list[Setting] = [
         options=[Option("auto", "Auto"), Option("original", "Original")],
         default="auto",
         help="Choose the default muxed audio from selected tracks only: Auto, Original, or one language tag. This does not download extra tracks.",
+    ),
+    Setting(
+        "default_subtitle",
+        "Default subtitle language",
+        "text",
+        options=[Option("auto", "Auto"), Option("original", "Original")],
+        default="auto",
+        help="Choose the default muxed subtitle from selected tracks only: Auto, Original, or one language tag. This does not download extra tracks.",
     ),
     _choice(
         "audio_selection",

@@ -134,6 +134,7 @@ class DownloadOptions(ParseOptions):
     mux_format: str | None = None
     muxer: str | None = None
     default_audio: str = "auto"
+    default_subtitle: str = "auto"
     mux_imports: list[str] = field(default_factory=list)
     #: Neutral UniDL JSON chapter document, converted for the selected muxer.
     chapters_file: str | None = None
@@ -218,6 +219,7 @@ class DownloadOptions(ParseOptions):
         if self.muxer:
             argv += ["--muxer", self.muxer]
         argv += ["--default-audio", self.default_audio or "auto"]
+        argv += ["--default-subtitle", self.default_subtitle or "auto"]
         for value in self.mux_imports:
             argv += ["--mux-import", value]
         if self.chapters_file:

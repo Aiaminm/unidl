@@ -63,6 +63,7 @@ from ..core.partner import (
 )
 from ..core.playback import LiveWindow, Playback, normalize_live_record_limit
 from ..core.service import Service
+from ..core.title_delay import parse_title_delay, sample_title_delay
 from ..core.vault import normalize_hex, split_pair
 from . import logline
 from .askhost import LOG_LIMIT
@@ -593,6 +594,10 @@ class SessionController:
         self.delivery: DownloadScreen | None = None
 
         self.job_running = False
+        #: True while an automatic batch is waiting before its next title.  It
+        #: shares the delivery pause/cancel controls but has no active downloader
+        #: job or track workers yet.
+        self._title_delay_active = False
         #: Textual's thread workers are backed by asyncio's executor.  Merely
         #: cancelling the Textual Worker does not join a synchronous service or
         #: downloader call, so the application needs an explicit completion
@@ -1150,9 +1155,17 @@ class SessionController:
     def pause_requested(self) -> bool:
         return self.pause_event.is_set()
 
+    @property
+    def title_delay_active(self) -> bool:
+        return self._title_delay_active
+
     def request_pause(self) -> bool:
         """Hold the running transfer without cancelling it. Returns False if already paused."""
-        if not self.job_running or self.cancel_event.is_set() or self.pause_event.is_set():
+        if (
+            not (self.job_running or self._title_delay_active)
+            or self.cancel_event.is_set()
+            or self.pause_event.is_set()
+        ):
             return False
         self.pause_event.set()
         self.post_log("paused; Resume continues from this point", "warning")
@@ -1192,10 +1205,9 @@ class SessionController:
         self.batch_cancelled = True
         self._shutdown_active_download()
         self.post_log("stopping at the next segment", "warning")
-        if self.job_running:
+        if self.job_running or self._title_delay_active:
             # only while there is something to stop: a cancellation asked for
-            # between two titles has no job whose ending would take this line down
-            # again, so it would sit there saying "Cancelling" for ever
+            # between two titles must also wake the interruptible title delay.
             self.post_status(tr("delivery.status.cancelling"))
         if self.delivery is not None:
             self._on_ui(self.delivery.refresh_keys)
@@ -1945,7 +1957,8 @@ class SessionController:
         # Both halves matter. A flow that keeps emitting without asking is still
         # the same run, however wrong its declared total turned out to be, so a
         # cancellation still applies to the rest of it.
-        if self.run_boundary and self.queue_complete:
+        new_run = self.run_boundary and self.queue_complete
+        if new_run:
             self.jobs = []
             self.commands = []
             self.command_audio_metadata = []
@@ -1955,6 +1968,11 @@ class SessionController:
             self.batch_total = None
             self.batch_declined = False
             self.clear_cancel()
+        elif self._should_delay_title(playback):
+            # The delay belongs to the batch scheduler, before the next title's
+            # service preparation/manifest/license work. It is intentionally not
+            # part of Engine.run or any per-track worker.
+            self._wait_for_title_delay(playback)
         self.run_boundary = False
 
         try:
@@ -1977,6 +1995,45 @@ class SessionController:
             return state
 
         return self._run_job(job, playback, presenter, ctx)
+
+    def _should_delay_title(self, playback: Playback) -> bool:
+        """Whether this playback is a subsequent automatic VOD batch item."""
+        if getattr(playback, "is_live", False) or self.batch_total is None or self.batch_total <= 1:
+            return False
+        if not self.jobs or self.run_boundary:
+            return False
+        return parse_title_delay(self.settings.get("title_delay")) is not None
+
+    def _wait_for_title_delay(self, playback: Playback) -> None:
+        """Wait between batch titles while keeping pause/stop responsive."""
+        delay = sample_title_delay(self.settings.get("title_delay"))
+        if delay is None:
+            return
+        self._title_delay_active = True
+        if self.delivery is not None:
+            self._on_ui(self.delivery.refresh_keys)
+        self.post_log(f"waiting {delay}s before next title: {playback.save_name}")
+        try:
+            remaining = delay
+            while remaining > 0:
+                if self.aborted or self.cancel_requested:
+                    return
+                if self.pause_requested:
+                    self.post_status(tr("delivery.status.title_delay_paused"))
+                    while self.pause_requested and not self.cancel_requested and not self.aborted:
+                        self.cancel_event.wait(0.25)
+                    continue
+                self.post_status(
+                    tr("delivery.status.title_delay", seconds=remaining)
+                )
+                if self.cancel_event.wait(1.0):
+                    return
+                remaining -= 1
+        finally:
+            self._title_delay_active = False
+            self.post_status("")
+            if self.delivery is not None:
+                self._on_ui(self.delivery.refresh_keys)
 
     def _run_job(self, job: Job, playback: Playback, presenter: TextualPresenter, ctx: FlowContext) -> str:
         """One title, start to finish, with the queue kept honest either way.
@@ -2488,6 +2545,19 @@ class SessionController:
                 self.post_field(tr("delivery.field.default_audio"), choice.label, "ok")
                 if choice.fallback:
                     self.post_log(tr(f"mux_audio.{choice.fallback}", language=choice.preference), "warning")
+
+        default_subtitle_resolver = getattr(self.engine, "default_subtitle_choice", None)
+        if callable(default_subtitle_resolver):
+            choice = default_subtitle_resolver(playback, self.settings, tracks)
+            if choice is not None and choice.stream is not None and not choice.supported:
+                self.post_log(tr("mux_subtitle.unsupported"), "warning")
+            elif choice is not None and choice.stream is not None:
+                self.post_field(tr("delivery.field.default_subtitle"), choice.label, "ok")
+            if choice is not None and choice.fallback:
+                self.post_log(
+                    tr(f"mux_subtitle.{choice.fallback}", language=choice.preference),
+                    "warning",
+                )
 
         if mode == "download":
             try:

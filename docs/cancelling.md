@@ -19,6 +19,20 @@ Pause waits at the next segment or live refresh. Back, the first Quit, and skip
 still cancel. The old Stop control cancelled immediately; that is what Pause
 replaced.
 
+## Delay between batch titles
+
+The global **Download behavior → Delay between titles** setting is a scheduler
+delay for automatic multi-title VOD batches. It is off by default. Enter `30` for
+a fixed 30-second wait, or `20-40` for a random wait in that range; `off` disables
+it. The first title starts immediately, and the wait happens before the next
+title begins service preparation, manifest work, or licensing. Tracks belonging
+to one title and live recording segments are never delayed, and a retry does not
+add a second title wait.
+
+While the delay is shown, **Pause** freezes its countdown and **Resume** carries
+it on. **Back**, **Escape**, or **Quit** cancels the remaining batch. The wait is
+interruptible, so stopping does not leave a sleeping worker behind.
+
 ## How it works
 
 The native delivery call is synchronous, so cancellation is carried by its

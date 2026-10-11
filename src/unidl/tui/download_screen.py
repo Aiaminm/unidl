@@ -305,13 +305,16 @@ class DownloadScreen(AskHost):
             attachment_button = attachments.first(ChromeButton)
             count = len(self._chapter_playback.attachments) if self._chapter_playback else 0
             attachment_button.display = count > 0
-            attachment_button.set_label("a", tr("attachments.title") + (f" {count}" if count else ""))
+            attachment_button.set_label(
+                "a",
+                tr("attachments.title") + (f" {count}" if count else ""),
+            )
             attachment_button.set_enabled(count > 0)
         found = self.query("#chrome-stop")
         if not found:
             return
         button = found.first(ChromeButton)
-        if self.controller.job_running:
+        if self.controller.job_running or getattr(self.controller, "title_delay_active", False):
             if self.controller.cancel_requested:
                 button.set_label("…", "Stopping")
                 button.set_enabled(False)
@@ -332,7 +335,7 @@ class DownloadScreen(AskHost):
 
     def action_stop_resume(self) -> None:
         """Pause the active job in place, resume it, or retry a finished row."""
-        if self.controller.job_running:
+        if self.controller.job_running or getattr(self.controller, "title_delay_active", False):
             if self.controller.pause_requested:
                 if self.controller.request_resume_pause():
                     self.notify(tr("delivery.notify.resumed"), timeout=4)
@@ -361,7 +364,10 @@ class DownloadScreen(AskHost):
 
     def prepare_quit(self) -> None:
         """A Quit click/escape is also an explicit stop signal for delivery."""
-        if self.controller.job_running and not self.controller.cancel_requested:
+        if (
+            self.controller.job_running
+            or getattr(self.controller, "title_delay_active", False)
+        ) and not self.controller.cancel_requested:
             self.controller.request_cancel()
             self.notify(tr("delivery.notify.stopping_quit"), timeout=5)
             self.refresh_keys()
@@ -720,6 +726,14 @@ class DownloadScreen(AskHost):
                     field(tr("delivery.field.default_audio"), visual_text(choice.label), palette.ok)
                     if choice.fallback:
                         field("", tr(f"mux_audio.{choice.fallback}", language=choice.preference), palette.warn)
+                subtitle_resolver = getattr(engine, "default_subtitle_choice", None)
+                subtitle_choice = subtitle_resolver(playback, self.controller.settings, tracks) if callable(subtitle_resolver) else None
+                if subtitle_choice is not None and subtitle_choice.stream is not None and not subtitle_choice.supported:
+                    field(tr("delivery.field.default_subtitle"), tr("mux_subtitle.unsupported"), palette.warn)
+                elif subtitle_choice is not None and subtitle_choice.stream is not None:
+                    field(tr("delivery.field.default_subtitle"), visual_text(subtitle_choice.label), palette.ok)
+                if subtitle_choice is not None and subtitle_choice.fallback:
+                    field("", tr(f"mux_subtitle.{subtitle_choice.fallback}", language=subtitle_choice.preference), palette.warn)
                 for index, stream in enumerate(tracks.selected, start=1):
                     field(
                         tr("delivery.field.stream", index=index),
@@ -837,7 +851,7 @@ class DownloadScreen(AskHost):
         keeps the worker and service flow alive long enough to finish cleanup and
         route the next ask to the page underneath.
         """
-        if self.controller.job_running:
+        if self.controller.job_running or getattr(self.controller, "title_delay_active", False):
             if self.controller.request_cancel():
                 self.notify(tr("delivery.notify.stopping"), timeout=4)
             else:

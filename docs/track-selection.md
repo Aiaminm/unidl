@@ -178,6 +178,34 @@ Services that obtain subtitles from a separate API should expose the complete
 inventory through Core's sidecar-track interface before selection. Those rows use
 the same language and kind filters as manifest subtitles.
 
+## Default subtitle in the muxed file
+
+**Subtitle languages** chooses which subtitle tracks to download. **Default
+subtitle language** (`default_subtitle`) chooses which of the final selected
+subtitle tracks receives the container's default playback flag. It never adds a
+track or widens the subtitle filters.
+
+Choose `Auto`, `Original`, or one language tag such as `en`, `fr-CA`, or
+`es-419`:
+
+| Value | Result |
+| --- | --- |
+| `auto` (default) | Prefer a source-marked default subtitle, then an explicitly original subtitle. Normal subtitles are preferred over forced/SDH when several candidates remain. |
+| `original` | Use an explicitly original subtitle among the selected tracks. If none is marked original, no default subtitle is set and a warning is shown. |
+| One language tag | Match that language only among selected tracks. A primary tag such as `en` accepts regional variants; a regional tag requires that region. If it is missing, UniDL falls back to the selected original-language subtitle; if that is also missing, no default is set. |
+
+`forced`, `sdh`, `commentary`, and `audio_description` are independent subtitle
+kind flags. A forced or SDH track can be the default when it is the only matching
+track, but it does not become default merely because it is forced. The setting
+also applies to service sidecar subtitles added through `prepare_download()`.
+
+The result is evaluated after the final picker selection for every title. It is
+stored in saved commands and native exports as `default_subtitle`; older exports
+use the current service setting or `Auto`. If no subtitles are selected, this
+setting has no effect. The default flag is a player hint and can be overridden by
+the player's own subtitle-language preference. MKV provides the most reliable
+subtitle disposition support; MP4 may have container/player-specific limits.
+
 ## Subtitle format and positioning
 
 Select **Tracks and output → Subtitle format** independently of subtitle

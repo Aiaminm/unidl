@@ -262,6 +262,52 @@ class _DefaultAudioEditor(_Editor):
         self.dismiss(value)
 
 
+class _DefaultSubtitleEditor(_Editor):
+    """A single subtitle preference: presets or one language tag."""
+
+    def compose_editor(self) -> ComposeResult:
+        yield OptionList(
+            Option(tr("setting.default_subtitle.option.auto"), id="auto"),
+            Option(tr("setting.default_subtitle.option.original"), id="original"),
+            Option(tr("mux_subtitle.specify_language"), id="language"),
+            id="default-subtitle-options",
+        )
+        yield Input(
+            value=str(self.current or "") if self.current not in {"auto", "original", None} else "",
+            placeholder="en / fr-CA / es-419",
+            classes="ask-input",
+            id="default-subtitle-language",
+        )
+
+    def on_mount(self) -> None:
+        options = self.query_one(OptionList)
+        field = self.query_one(Input)
+        custom = self.current not in {"auto", "original", None}
+        options.highlighted = 2 if custom else (1 if self.current == "original" else 0)
+        field.display = custom
+        (field if custom else options).focus()
+
+    def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
+        event.stop()
+        if event.option.id in {"auto", "original"}:
+            self.dismiss(event.option.id)
+            return
+        field = self.query_one(Input)
+        field.display = True
+        field.focus()
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        from ..downloader.mux_subtitle import normalize_default_subtitle
+
+        event.stop()
+        try:
+            value = normalize_default_subtitle(event.value)
+        except ValueError:
+            self.notify(tr("mux_subtitle.invalid_language"), severity="warning")
+            return
+        self.dismiss(value)
+
+
 class _TextEditor(_Editor):
     def compose_editor(self) -> ComposeResult:
         yield Input(
@@ -276,6 +322,38 @@ class _TextEditor(_Editor):
     def on_input_submitted(self, event: Input.Submitted) -> None:
         event.stop()
         self.dismiss(event.value)
+
+
+class _TitleDelayEditor(_Editor):
+    """Validate the batch-only inter-title delay before saving it."""
+
+    def compose_editor(self) -> ComposeResult:
+        yield Input(
+            value="" if self.current is None else str(self.current),
+            placeholder="off / 30 / 20-40",
+            classes="ask-input",
+        )
+
+    def on_mount(self) -> None:
+        self.query_one(Input).focus()
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        from ..core.title_delay import normalize_title_delay
+
+        event.stop()
+        try:
+            value = normalize_title_delay(event.value)
+        except ValueError as exc:
+            self.notify(
+                tr(
+                    "title_delay.invalid",
+                    default=f"Invalid title delay: {exc}",
+                    error=str(exc),
+                ),
+                severity="warning",
+            )
+            return
+        self.dismiss(value)
 
 
 #: Which settings are name templates, and which fields each may use. A table rather
@@ -692,6 +770,7 @@ class SettingsScreen(Screen):
                         "retries",
                         "http_timeout",
                         "max_speed",
+                        "title_delay",
                         "muxer",
                         "segment_downloader",
                         "resume_parts",
@@ -725,8 +804,12 @@ class SettingsScreen(Screen):
             self._pick_vaults(spec, scope, _done)
             return
 
-        if spec.key == "default_audio":
+        if spec.key == "title_delay":
+            self.app.push_screen(_TitleDelayEditor(spec, scope.get(spec.key)), _done)
+        elif spec.key == "default_audio":
             self.app.push_screen(_DefaultAudioEditor(spec, scope.get(spec.key)), _done)
+        elif spec.key == "default_subtitle":
+            self.app.push_screen(_DefaultSubtitleEditor(spec, scope.get(spec.key)), _done)
         elif spec.kind == "multi" and spec.options:
             self.app.push_screen(_MultiChoiceEditor(spec, scope.get(spec.key)), _done)
         elif spec.kind == "choice" and spec.options:

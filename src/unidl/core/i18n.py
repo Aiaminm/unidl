@@ -834,6 +834,9 @@ def setting_value(spec: Any, scope: Any) -> str:
     """Translated current value for a settings row."""
     if getattr(spec, "kind", "") == "bool":
         return tr("value.on") if scope.get(spec.key) else tr("value.off")
+    if getattr(spec, "key", "") == "title_delay":
+        value = str(scope.get(spec.key) or "off").strip()
+        return tr("value.off") if value.casefold() == "off" else value
     if getattr(spec, "picker", "") in {
         "resources",
         "storage",

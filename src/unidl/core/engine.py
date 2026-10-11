@@ -29,6 +29,11 @@ import requests
 from unidl.downloader import NativeDownloaderBackend, NativeManifestError, api
 from unidl.downloader.models import StreamInfo
 from unidl.downloader.mux_audio import normalize_default_audio, resolve_default_audio
+from unidl.downloader.mux_subtitle import (
+    normalize_default_subtitle,
+    original_subtitle,
+    resolve_default_subtitle,
+)
 from unidl.downloader.selection import SelectionOptions, SelectionResult, select_streams, select_streams_detailed
 from unidl.downloader.utils import is_url, looks_like_h266, source_path
 
@@ -3447,6 +3452,9 @@ class Engine:
         if downloader not in {"python", "aria2c", "auto"}:
             downloader = "python"
         max_speed = str(settings.get("max_speed", "") or "").strip() or None
+        default_subtitle_choice = self.default_subtitle_choice(playback, settings, tracks)
+        if default_subtitle_choice is not None:
+            self._annotate_subtitle_imports(playback, tracks, default_subtitle_choice)
         policy = DownloadPolicy(
             workers=int(settings.get("workers", 16) or 16),
             retries=int(settings.get("retries", 5) or 5),
@@ -3460,8 +3468,9 @@ class Engine:
             mux_format=mux_format,
             muxer=muxer,
             default_audio=self.default_audio_preference(playback, settings),
+            default_subtitle=self.default_subtitle_preference(playback, settings),
             mux_imports=tuple(
-                f"path={track.path}:lang={track.language}:name={track.name or track.language}"
+                self._mux_import_value(track)
                 for track in playback.mux_imports
             ),
             chapters_file=chapters_sidecar,
@@ -3528,6 +3537,88 @@ class Engine:
     @staticmethod
     def default_audio_preference(playback: Playback, settings: Settings) -> str:
         return normalize_default_audio(playback.default_audio or settings.get("default_audio", "auto"))
+
+    @staticmethod
+    def default_subtitle_preference(playback: Playback, settings: Settings) -> str:
+        return normalize_default_subtitle(
+            playback.default_subtitle or settings.get("default_subtitle", "auto")
+        )
+
+    @staticmethod
+    def _mux_import_value(track) -> str:
+        """Serialize a prepared sidecar while retaining its subtitle metadata."""
+        parts = [
+            f"path={track.path}",
+            f"lang={track.language}",
+            f"name={track.name or track.language}",
+        ]
+        if getattr(track, "kind", "normal"):
+            parts.append(f"kind={track.kind}")
+        if getattr(track, "original", False):
+            parts.append("original=true")
+        if getattr(track, "default", None) is not None:
+            parts.append(f"default={'true' if track.default else 'false'}")
+        if getattr(track, "forced", None) is not None:
+            parts.append(f"forced={'true' if track.forced else 'false'}")
+        return ":".join(parts)
+
+    @staticmethod
+    def _annotate_subtitle_imports(playback: Playback, tracks: TrackSet, choice) -> None:
+        """Transfer picker metadata to files staged by ``prepare_download``."""
+        sidecars = [
+            stream
+            for stream in tracks.selected
+            if stream.extra.get("service_sidecar") == "subtitle"
+        ]
+        if not sidecars or not playback.mux_imports:
+            return
+        remaining = list(sidecars)
+        for imported in playback.mux_imports:
+            language = str(imported.language or "").casefold()
+            name = str(imported.name or "").casefold()
+            match = next(
+                (
+                    stream
+                    for stream in remaining
+                    if str(stream.language or "").casefold() == language
+                    and str(stream.name or "").casefold() == name
+                ),
+                None,
+            )
+            if match is None:
+                match = next(
+                    (
+                        stream
+                        for stream in remaining
+                        if str(stream.language or "").casefold() == language
+                    ),
+                    None,
+                )
+            if match is None:
+                continue
+            remaining.remove(match)
+            imported.kind = str(
+                match.extra.get("subtitle_kind") or match.group_id or "normal"
+            )
+            imported.original = original_subtitle(match)
+            imported.forced = "forced" in str(imported.kind).casefold()
+            imported.default = match is getattr(choice, "stream", None)
+
+    def default_subtitle_choice(self, playback: Playback, settings: Settings, tracks: TrackSet):
+        """Preview the default subtitle among the final selected tracks."""
+        if playback.audio_only or self.output_scope_types(
+            settings,
+            scope=playback.output_scope or None,
+            output_types=playback.output_types or None,
+        ) != {"video", "audio", "subtitle"}:
+            return None
+        choice = resolve_default_subtitle(
+            tracks.selected,
+            self.default_subtitle_preference(playback, settings),
+        )
+        if str(settings.get("mux_format", "mkv")).lower() in {"ts", "m2ts"}:
+            return replace(choice, supported=False)
+        return choice
 
     def default_audio_choice(self, playback: Playback, settings: Settings, tracks: TrackSet):
         """Preview the same final-selection preference used by native muxing."""
@@ -3602,6 +3693,7 @@ class Engine:
             mux_format=mux_format,
             muxer=muxer,
             default_audio=self.default_audio_preference(playback, settings),
+            default_subtitle=self.default_subtitle_preference(playback, settings),
             sub_format=str(settings.get("sub_format", "srt")),
             sub_only=output_types == {"subtitle"},
             auto_subtitle_fix=bool(settings.get("auto_subtitle_fix", True)),
@@ -3639,7 +3731,7 @@ class Engine:
             options.custom_hls_method = drm.hls_method or ("AES_128" if drm.hls_key else None)
             options.hls_decryptor = drm.hls_decryptor
         options.mux_imports = [
-            f"path={track.path}:lang={track.language}:name={track.name or track.language}"
+            self._mux_import_value(track)
             for track in playback.mux_imports
         ]
         chapters_sidecar = (
@@ -3825,6 +3917,7 @@ class Engine:
             f"video_selection={playback.video_selection or settings.get('video_selection', 'best') or 'best'} "
             f"audio_selection={playback.audio_selection or settings.get('audio_selection', 'best') or 'best'} "
             f"default_audio={self.default_audio_preference(playback, settings)} "
+            f"default_subtitle={self.default_subtitle_preference(playback, settings)} "
             f"subtitle_selection={playback.subtitle_selection or settings.get('subtitle_selection', 'all') or 'all'}"
         )
         note()
@@ -3917,10 +4010,18 @@ class Engine:
                         "video_selection": str((settings or {}).get("video_selection", "best") or "best"),
                         "audio_selection": str((settings or {}).get("audio_selection", "best") or "best"),
                         "default_audio": self.default_audio_preference(playback, settings or {}),
+                        "default_subtitle": self.default_subtitle_preference(playback, settings or {}),
                         "subtitle_selection": str((settings or {}).get("subtitle_selection", "all") or "all"),
                     }
                     if settings is not None
-                    else ({"default_audio": playback.default_audio} if playback.default_audio else {})
+                    else {
+                        key: value
+                        for key, value in (
+                            ("default_audio", playback.default_audio),
+                            ("default_subtitle", playback.default_subtitle),
+                        )
+                        if value
+                    }
                 ),
             )
 

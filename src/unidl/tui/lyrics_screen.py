@@ -6,7 +6,7 @@ from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen
-from textual.widgets import Static
+from textual.widgets import Button, Static
 
 from ..core.i18n import tr
 from ..core.lyrics import Lyrics, timestamp
@@ -60,6 +60,9 @@ class LyricsScreen(ModalScreen[None]):
                         f"     {visual_markup(line.text)}",
                         classes=f"lyrics-row {'odd' if index % 2 else 'even'}",
                     )
+            with Horizontal(id="lyrics-modal-nav"):
+                yield Button(f"‹ {tr('modal.previous')}", id="lyrics-previous")
+                yield Button(f"{tr('modal.next')} ›", id="lyrics-next")
             yield Static(
                 f"[$muted]{tr('lyrics.close_hint')}[/]",
                 id="lyrics-modal-hint",
@@ -77,6 +80,19 @@ class LyricsScreen(ModalScreen[None]):
             listing.scroll_home(animate=False)
         else:
             listing.scroll_end(animate=False)
+
+    def action_previous(self) -> None:
+        self.action_scroll(-12)
+
+    def action_next(self) -> None:
+        self.action_scroll(12)
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        event.stop()
+        if event.button.id == "lyrics-previous":
+            self.action_previous()
+        elif event.button.id == "lyrics-next":
+            self.action_next()
 
     def action_close(self) -> None:
         self.dismiss(None)

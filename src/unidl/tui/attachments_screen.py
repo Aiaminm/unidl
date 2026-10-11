@@ -10,7 +10,7 @@ from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.screen import ModalScreen
-from textual.widgets import Static
+from textual.widgets import Button, Static
 
 from ..core.attachments import Attachment, count_label
 from ..core.i18n import tr
@@ -68,6 +68,9 @@ class AttachmentsScreen(ModalScreen[None]):
             else:
                 yield Static("", id="attachment-image", classes="attachment-image")
             yield Static("", id="attachment-info")
+            with Horizontal(id="attachment-modal-nav"):
+                yield Button(f"‹ {tr('modal.previous')}", id="attachment-previous", disabled=len(self.attachments) < 2)
+                yield Button(f"{tr('modal.next')} ›", id="attachment-next", disabled=len(self.attachments) < 2)
             yield Static(tr("attachments.browse_hint"), id="attachment-modal-hint")
 
     def on_mount(self) -> None:
@@ -137,6 +140,13 @@ class AttachmentsScreen(ModalScreen[None]):
         if self.attachments:
             self.index = (self.index + 1) % len(self.attachments)
             self._refresh()
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        event.stop()
+        if event.button.id == "attachment-previous":
+            self.action_previous()
+        elif event.button.id == "attachment-next":
+            self.action_next()
 
     def action_close(self) -> None:
         self.dismiss(None)

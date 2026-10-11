@@ -184,6 +184,7 @@ heartbeat interval is part of the shared settings contract.
 | `retries` | integer | `5` | Compatibility key controlled by **Download behavior**. Segment retry count for the native engine. |
 | `http_timeout` | seconds | `30` | Compatibility key controlled by **Download behavior**. HTTP timeout for native segment requests. |
 | `max_speed` | e.g. `15M` | empty | Compatibility key controlled by **Download behavior**. Empty means unlimited. |
+| `title_delay` | `off`, `30`, or `20-40` | `off` | Compatibility key controlled by **Download behavior**. Adds a random or fixed delay between automatically queued VOD titles. It does not delay tracks within one title or live recording segments. |
 | `muxer` | `auto` / `ffmpeg` / `mkvmerge` | `auto` | Compatibility key controlled by **Download behavior**. Which mux tool writes the final file. Per-service **Container** still chooses mkv vs mp4. |
 | `segment_downloader` | `python` / `aria2c` | `python` | Compatibility key controlled by **Download behavior**. `aria2c` is used only when chosen and installed. |
 | `resume_parts` | on / off | on | Compatibility key controlled by **Download behavior**. Reuse verified tmp parts after a pause or retry. |
@@ -344,6 +345,7 @@ provider API request or replace a service's explicit `license_*` policy.
 | `audio_channels` | `any` / `2` / `6` / `8` | `any` |
 | `audio_langs` | comma separated BCP-47/ISO tags, empty = best language | empty |
 | `default_audio` | `auto` / `original` / one language tag; only final selected audio participates | `auto` |
+| `default_subtitle` | `auto` / `original` / one language tag; only final selected subtitles participate | `auto` |
 | `audio_selection` | `best` / `all` | `best` |
 | `sub_langs` | comma separated, `all`, or empty to skip | `all` |
 | `subtitle_kinds` | comma separated `normal`, `forced`, `sdh`, `commentary`, `audio_description`, or `all` | `normal,forced` |
@@ -415,6 +417,14 @@ or cancel a download. Each batch title resolves the preference after its final
 selection. Exports and saved commands preserve it. See
 [track-selection.md](track-selection.md#default-audio-in-the-muxed-file) for
 priority, regional matching, live recording, and container limitations.
+
+`default_subtitle` is the corresponding muxed-subtitle setting. It is separate
+from `sub_langs` and `subtitle_kinds`: those settings choose what is downloaded,
+while this setting only marks one already-selected subtitle as the container
+default. It supports Auto, Original, and one language tag, including service
+sidecar subtitles; missing matches fall back to the selected original subtitle
+or leave the default flag unset with a warning. See
+[track-selection.md](track-selection.md#default-subtitle-in-the-muxed-file).
 
 ### Do not remove `drop_video` without reading this
 

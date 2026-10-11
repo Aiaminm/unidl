@@ -183,6 +183,10 @@ class ExternalTrack:
     path: str
     language: str = "und"
     name: str = ""
+    kind: str = "normal"
+    original: bool = False
+    default: bool | None = None
+    forced: bool | None = None
 
 
 @dataclass(frozen=True)
@@ -289,6 +293,7 @@ class Playback:
     video_selection: str = ""
     audio_selection: str = ""
     default_audio: str = ""
+    default_subtitle: str = ""
     subtitle_selection: str = ""
 
     #: What the service asked its playback API for, and what that API explicitly
