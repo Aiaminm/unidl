@@ -87,6 +87,25 @@ directories below are derived from it; finished downloads are the exception:
 | subtitles | Service-fetched subtitle sidecars. |
 | helpers | Service helper assets and modules. |
 
+### Finished-file layout and failed tasks
+
+Finished media is grouped under `downloads/<service>/`. The optional
+`episode_folder_template` setting adds another relative folder layer for
+episode titles only; movies, live programs and audio titles stay directly in
+the service folder. For example, `{series}/{season}` produces
+`downloads/<service>/<series>/Season 01/<file>`. Available fields are
+`{series}`, `{season}`, `{season_number}`, `{year}`, `{season_episode}` and
+`{service}`. The template is validated as a relative path and cannot escape
+the service directory. An empty value preserves the flat service layout.
+
+During a download, track files, sidecar subtitles and the file being muxed are
+staged in an isolated per-task workspace. A successful task commits only its
+finished artifacts to the destination folder. A failed or cancelled task
+removes that workspace by default, so partial files do not accumulate beside
+completed downloads. `keep_failed_intermediates` can be enabled when debugging
+to retain that failed workspace; it is independent from `keep_temp`, which
+controls resumable segment caches.
+
 Core creates directories on demand and applies owner-only permissions to
 credential, device, key and log state where the operating system supports them.
 

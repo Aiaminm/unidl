@@ -197,7 +197,7 @@ class GlobalSearchScreen(Screen):
     def compose(self) -> ComposeResult:
         yield Chrome(show_search=False, show_settings=False)
         yield Static("", id="masthead")
-        with Horizontal(id="statusline"):
+        with Horizontal(id="search-statusline"):
             yield StatusChip("add_keys", id="vault-add-chip")
             yield Static("·", classes="chip-sep")
             yield Static("", id="subhead", classes="pill chip-static")

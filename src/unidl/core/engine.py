@@ -65,6 +65,7 @@ from .delivery import (
     LiveKeyRequest as CoreLiveKeyRequest,
 )
 from .diagnostics import DebugRecorder, activate, safe_log_text
+from .output_paths import render_episode_folder
 from .playback import Playback, normalize_live_record_limit
 from .secureio import atomic_write_bytes, atomic_write_text, locked_path, private_directory, private_file, safe_filename
 from .settings import Settings, normalize_drop_video_pattern
@@ -3190,8 +3191,14 @@ class Engine:
         return bool(value)
 
     # --------------------------------------------------------------- download
-    def save_dir(self, settings: Settings | None = None, service: str = "") -> Path:
-        """Where files land: the root, then a folder for the service.
+    def save_dir(
+        self,
+        settings: Settings | None = None,
+        service: str = "",
+        *,
+        title=None,
+    ) -> Path:
+        """Where finished files land: root, service, and optional episode folders.
 
         One answer for downloads and live recordings both, because they are the same
         question and answering it in two places is how they end up in two folders.
@@ -3199,21 +3206,30 @@ class Engine:
         editing a file, and an empty setting means "whatever unidl.yaml says" rather
         than "nowhere".
 
-        The per-service folder is not optional. A flat folder of a few thousand
-        files from a hundred services is not somewhere you find anything, and the
-        service is the one thing every file in it has in common.
+        The per-service folder is not optional. An optional episode template is
+        applied below it only for structured ``TitleKind.EPISODE`` values; movies,
+        live programs and audio tracks retain the service-level layout.
         """
         chosen = str((settings.get("download_dir") if settings else "") or "").strip()
         root = Path(chosen).expanduser() if chosen else self.config.paths.downloads
         name = _folder_name(service)
-        return root / name if name else root
+        directory = root / name if name else root
+        folder_template = str(
+            (settings.get("episode_folder_template") if settings else "") or ""
+        ).strip()
+        if title is not None and folder_template:
+            directory = directory.joinpath(*render_episode_folder(folder_template, title, service))
+        return directory
 
     def download_attachments(self, playback: Playback, settings: Settings, *, service: str = "") -> tuple[Path, ...]:
         """Download optional title attachments as independent sidecar files."""
         attachments = tuple(playback.attachments or ())
         if not attachments:
             return ()
-        target_dir = private_directory(self.save_dir(settings, service) / f"{safe_filename(playback.save_name)}.attachments")
+        target_dir = private_directory(
+            self.save_dir(settings, service, title=playback.title)
+            / f"{safe_filename(playback.save_name)}.attachments"
+        )
         written: list[Path] = []
         for index, attachment in enumerate(attachments, start=1):
             try:
@@ -3506,6 +3522,7 @@ class Engine:
             write_meta_json=debug,
             keep_temp=debug or bool(settings.get("keep_temp", False)),
             keep_after_done=debug or not bool(settings.get("delete_temp_after_done", True)),
+            keep_failed_intermediates=debug or bool(settings.get("keep_failed_intermediates", False)),
             no_color=self.frame is None,
             live=LivePolicy(
                 enabled=playback.is_live,
@@ -3523,7 +3540,11 @@ class Engine:
             manifest=manifest,
             selected_track_ids=selected_track_ids,
             save_name=playback.save_name,
-            output_dir=self.save_dir(settings, playback.title.service),
+            output_dir=self.save_dir(
+                settings,
+                playback.title.service,
+                title=playback.title,
+            ),
             keys=tuple(playback.keys),
             service_context={
                 **(dict(playback.drm.context) if playback.drm is not None else {}),
@@ -3674,7 +3695,13 @@ class Engine:
             proxy=download_proxy,
             base_url=playback.manifest_base_url,
             save_name=playback.save_name,
-            save_dir=str(self.save_dir(settings, playback.title.service)),
+            save_dir=str(
+                self.save_dir(
+                    settings,
+                    playback.title.service,
+                    title=playback.title,
+                )
+            ),
             keys=list(playback.keys),
             service_context={
                 **(dict(drm.context) if drm is not None else {}),
@@ -3716,6 +3743,7 @@ class Engine:
             write_meta_json=debug,
             keep_temp=debug or bool(settings.get("keep_temp", False)),
             no_del_after_done=debug or not bool(settings.get("delete_temp_after_done", True)),
+            keep_failed_intermediates=debug or bool(settings.get("keep_failed_intermediates", False)),
             log_file_path=(
                 str(
                     self._debug_log_path.get()
@@ -4106,7 +4134,11 @@ class Engine:
             # actual file still contains the lower-level downloader output and
             # sensitive request details; this line is only a pointer.
             self.log(f"debug log: {debug_path}")
-        where = self.save_dir(settings, playback.title.service)
+        where = self.save_dir(
+            settings,
+            playback.title.service,
+            title=playback.title,
+        )
         where.mkdir(parents=True, exist_ok=True)
 
         if cancel is not None and cancel.is_set():

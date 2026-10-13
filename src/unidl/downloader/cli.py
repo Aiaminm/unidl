@@ -5,6 +5,7 @@ import builtins
 import contextlib
 import contextvars
 import copy
+import errno
 import hashlib
 import json
 import math
@@ -381,6 +382,11 @@ def _build_parser(
     g_net.add_argument("-R", "--max-speed", help="Limit download speed, e.g. 15M, 100K, 2Mbps.")
     g_net.add_argument("--dash-full-base-url", action="store_true", help="For DASH SegmentList byte-range VOD, download the full underlying BaseURL media file instead of the MPD byte ranges.")
     g_net.add_argument("--keep-temp", action="store_true", help="Keep temporary segment directories.")
+    g_net.add_argument(
+        "--keep-failed-intermediates",
+        action="store_true",
+        help="Keep staged track files and failed mux output after a failed task for debugging.",
+    )
     g_net.add_argument("--del-after-done", dest="del_after_done", action="store_true", default=True, help="Delete temporary segment directories after a successful task. Default: true.")
     g_net.add_argument("--no-del-after-done", dest="del_after_done", action="store_false", help="Keep temporary segment directories after a successful task.")
     g_select.add_argument("--auto-select", action="store_true", help="Automatically select best video and best audio.")
@@ -493,6 +499,7 @@ def _looks_like_download(argv: list[str]) -> bool:
         "--del-after-done",
         "--no-del-after-done",
         "--keep-temp",
+        "--keep-failed-intermediates",
         "--mux",
         "-M",
         "--mux-after-done",
@@ -784,6 +791,17 @@ def _list(args: argparse.Namespace) -> int:
 
 
 def _download(args: argparse.Namespace) -> int:
+    """Run one delivery and always settle its staged work directory."""
+    try:
+        result = _download_impl(args)
+    except BaseException:
+        _settle_task_workspace(args, success=False)
+        raise
+    _settle_task_workspace(args, success=result == 0)
+    return result
+
+
+def _download_impl(args: argparse.Namespace) -> int:
     _checkpoint_embedding(args)
     colors = _colors(args)
     # Validate a user-supplied sidecar before fetching or downloading media. Core
@@ -922,6 +940,10 @@ def _download(args: argparse.Namespace) -> int:
     task_temp_root = _task_temp_root(args, hydrated, default_save_base)
     _migrate_legacy_task_temp_roots(args, hydrated, default_save_base, task_temp_root)
     args._unidown_task_temp_root = task_temp_root
+    task_workspace = _task_workspace_root(args, task_temp_root, output_dir)
+    args._unidown_task_workspace = task_workspace
+    args._unidown_commit_targets = {}
+    staged_output_dir = task_workspace / "tracks"
     downloaded_paths: list[Path] = []
     downloaded_tracks: list[_DownloadedTrack] = []
     metadata_paths: list[Path] = []
@@ -938,7 +960,7 @@ def _download(args: argparse.Namespace) -> int:
         probe_network=not bool(args.custom_range),
     )
     if args.write_meta_json:
-        meta_path = _write_meta_json(output_dir, args.save_name, streams, hydrated)
+        meta_path = _write_meta_json(task_workspace / "metadata", args.save_name, streams, hydrated)
         metadata_paths.append(meta_path)
         print(f"{paint('Meta:', Palette.green, colors)} {meta_path}")
         _log_line(args, f"Meta: {meta_path}")
@@ -947,9 +969,18 @@ def _download(args: argparse.Namespace) -> int:
     live_streams = [stream for stream in hydrated if stream.is_live and not args.live_perform_as_vod]
     task_started_at = time.monotonic()
     if live_streams:
-        pipe_session = _start_live_pipe_mux_session(live_streams, mux_target, args.save_name, default_save_base, args, keys, colors, hls_crypto=hls_crypto, temp_dir=_task_temp_subdir(args, "pipe"))
+        pipe_destination = _live_pipe_output_path(
+            mux_target,
+            args.save_name,
+            default_save_base,
+            streams=live_streams,
+            mux_format=getattr(args, "mux_format", None),
+        )
+        pipe_stage = _stage_artifact_path(task_workspace, pipe_destination)
+        args._unidown_commit_targets[pipe_stage] = pipe_destination
+        pipe_session = _start_live_pipe_mux_session(live_streams, pipe_stage, args.save_name, default_save_base, args, keys, colors, hls_crypto=hls_crypto, temp_dir=_task_temp_subdir(args, "pipe"))
         try:
-            downloaded_tracks = _record_live_streams(live_streams, streams, args, headers, keys, output, output_dir, pipe_session=pipe_session, hls_crypto=hls_crypto)
+            downloaded_tracks = _record_live_streams(live_streams, streams, args, headers, keys, pipe_stage, staged_output_dir, pipe_session=pipe_session, hls_crypto=hls_crypto)
         except BaseException:
             if pipe_session:
                 pipe_session.close(cancelled=True)
@@ -979,12 +1010,14 @@ def _download(args: argparse.Namespace) -> int:
                 print(paint("Live subtitles kept as sidecar files.", Palette.yellow, colors))
         elif _should_mux_after_download(args, mux_imports, downloaded_paths, live_streams):
             live_mux_tracks = _live_mux_tracks(downloaded_tracks, args)
-            mux_output = _mux_output_path(
+            mux_destination = _mux_output_path(
                 mux_target,
                 args.save_name,
                 default_save_base,
                 _mux_format_for_tracks(live_mux_tracks, args, live=True),
             )
+            mux_output = _stage_artifact_path(task_workspace, mux_destination)
+            args._unidown_commit_targets[mux_output] = mux_destination
             explicit_mux = getattr(args, "mux", False) or bool(mux_imports)
             if live_mux_tracks and (len(live_mux_tracks) > 1 or explicit_mux):
                 task_line = _TaskStatusLine(
@@ -1038,6 +1071,13 @@ def _download(args: argparse.Namespace) -> int:
         if not getattr(args, "live_keep_segments", True):
             _cleanup_temp_dirs(temp_dirs, args, colors)
         _print_cleanup_summary(args, colors)
+        protected_paths, metadata_paths = _commit_task_outputs(
+            args,
+            output_dir,
+            protected_paths,
+            downloaded_tracks,
+            metadata_paths,
+        )
         _emit_download_artifacts(
             args,
             protected_paths,
@@ -1071,7 +1111,7 @@ def _download(args: argparse.Namespace) -> int:
                         keys,
                         hls_crypto,
                         max_speed,
-                        output_dir,
+                        staged_output_dir,
                         default_save_base,
                         False,
                         progress_callback=panel.progress_for(offset) if panel.enabled else None,
@@ -1107,7 +1147,7 @@ def _download(args: argparse.Namespace) -> int:
                 keys,
                 hls_crypto,
                 max_speed,
-                output_dir,
+                staged_output_dir,
                 default_save_base,
                 True,
             )
@@ -1141,13 +1181,15 @@ def _download(args: argparse.Namespace) -> int:
         _cleanup_temp_dirs(temp_dirs, args, colors)
         vvc_vod = _tracks_include_vvc(downloaded_tracks)
         mux_format = _mux_format_for_tracks(downloaded_tracks, args, live=False)
-        mux_output = _mux_output_path(
+        mux_destination = _mux_output_path(
             mux_target,
             args.save_name,
             default_save_base,
             mux_format,
             force_suffix=vvc_vod,
         )
+        mux_output = _stage_artifact_path(task_workspace, mux_destination)
+        args._unidown_commit_targets[mux_output] = mux_destination
         task_line = _TaskStatusLine(
             mux_output,
             task_started_at,
@@ -1176,6 +1218,13 @@ def _download(args: argparse.Namespace) -> int:
     _cleanup_intermediate_files(intermediate_paths, protected=protected_paths, args=args, colors=colors)
     _cleanup_temp_dirs(temp_dirs, args, colors)
     _print_cleanup_summary(args, colors)
+    protected_paths, metadata_paths = _commit_task_outputs(
+        args,
+        output_dir,
+        protected_paths,
+        downloaded_tracks,
+        metadata_paths,
+    )
     _emit_download_artifacts(
         args,
         protected_paths,
@@ -1579,6 +1628,7 @@ class _DownloadedTrack:
     path: Path
     temp_dir: Path | None
     cleanup_paths: list[Path]
+    cache_filename: str | None = None
 
 
 def _embedding_cancel_callback(args) -> Callable[[], bool] | None:
@@ -2004,6 +2054,7 @@ def _download_selected_stream(
             path=cached_path,
             temp_dir=None,
             cleanup_paths=cleanup_paths,
+            cache_filename=name,
         )
     if stream.encrypted and not args.no_decrypt:
         _ensure_hls_segment_crypto_ready([stream], hls_crypto)
@@ -2231,7 +2282,14 @@ def _download_selected_stream(
     _write_completed_track_cache(stream, name, args, current_path, cleanup_paths)
     result_temp_dir = _cleanup_track_temp_dir(result_temp_dir, args, colors)
     status.finish()
-    return _DownloadedTrack(offset=offset, stream=stream, path=current_path, temp_dir=result_temp_dir, cleanup_paths=cleanup_paths)
+    return _DownloadedTrack(
+        offset=offset,
+        stream=stream,
+        path=current_path,
+        temp_dir=result_temp_dir,
+        cleanup_paths=cleanup_paths,
+        cache_filename=name,
+    )
 
 
 def _should_decrypt_fragmented_parts(stream, result) -> bool:
@@ -7575,6 +7633,158 @@ def _task_temp_root(args: argparse.Namespace, streams, default_save_base: str | 
         base_root / f"{safe_label}_{digest}",
         max_length=WINDOWS_INTERMEDIATE_PATH_LIMIT - 100,
     )
+
+
+def _task_workspace_root(
+    args: argparse.Namespace,
+    task_temp_root: Path,
+    output_dir: Path,
+) -> Path:
+    """Choose a per-task assembly directory without mixing files into output."""
+
+    cache_parent = Path(task_temp_root).expanduser().parent
+    output_parent = Path(output_dir).expanduser()
+    cache_parent.mkdir(parents=True, exist_ok=True)
+    output_parent.mkdir(parents=True, exist_ok=True)
+    try:
+        same_device = cache_parent.stat().st_dev == output_parent.stat().st_dev
+    except OSError:
+        same_device = True
+    parent = cache_parent if same_device else output_parent / ".unidl-work"
+    run_id = uuid.uuid4().hex[:12]
+    root = bounded_path(
+        parent / f".{Path(task_temp_root).name}.{run_id}.work",
+        max_length=WINDOWS_INTERMEDIATE_PATH_LIMIT - 80,
+    )
+    (root / "tracks").mkdir(parents=True, exist_ok=True)
+    (root / "final").mkdir(parents=True, exist_ok=True)
+    (root / "metadata").mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def _stage_artifact_path(workspace: Path, destination: Path) -> Path:
+    """Return a short staged path for a final artifact's basename."""
+
+    return bounded_path(
+        workspace / "final" / destination.name,
+        max_length=WINDOWS_INTERMEDIATE_PATH_LIMIT,
+    )
+
+
+def _path_is_under(path: Path, root: Path) -> bool:
+    try:
+        Path(path).expanduser().resolve(strict=False).relative_to(
+            Path(root).expanduser().resolve(strict=False)
+        )
+    except (OSError, ValueError):
+        return False
+    return True
+
+
+def _move_staged_artifact(source: Path, destination: Path) -> Path:
+    """Commit one staged file, falling back safely across filesystems."""
+
+    source = Path(source).expanduser()
+    destination = Path(destination).expanduser()
+    if not source.is_file():
+        raise FileNotFoundError(f"staged artifact is missing: {source}")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        os.replace(windows_long_path(source), windows_long_path(destination))
+        return destination
+    except OSError as exc:
+        if exc.errno != errno.EXDEV:
+            raise
+    partial = destination.with_name(f".{destination.name}.{uuid.uuid4().hex[:8]}.commit")
+    try:
+        shutil.copy2(windows_long_path(source), windows_long_path(partial))
+        os.replace(windows_long_path(partial), windows_long_path(destination))
+        source.unlink()
+    finally:
+        try:
+            partial.unlink()
+        except OSError:
+            pass
+    return destination
+
+
+def _commit_task_outputs(
+    args: argparse.Namespace,
+    output_dir: Path,
+    protected_paths: Sequence[Path],
+    tracks: Sequence[_DownloadedTrack],
+    metadata_paths: Sequence[Path],
+) -> tuple[list[Path], list[Path]]:
+    """Move successful staged artifacts into the user's output directory."""
+
+    workspace = getattr(args, "_unidown_task_workspace", None)
+    if workspace is None:
+        return list(protected_paths), list(metadata_paths)
+    workspace = Path(workspace).expanduser()
+    preferred = {
+        _path_key(Path(source)): Path(destination).expanduser()
+        for source, destination in getattr(args, "_unidown_commit_targets", {}).items()
+    }
+    moved: dict[str, Path] = {}
+
+    def commit(path: Path) -> Path:
+        path = Path(path).expanduser()
+        key = _path_key(path)
+        if key in moved:
+            return moved[key]
+        if not _path_is_under(path, workspace):
+            moved[key] = path
+            return path
+        destination = preferred.get(key)
+        if destination is None:
+            destination = unique_path(
+                bounded_path(output_dir / path.name, max_length=WINDOWS_INTERMEDIATE_PATH_LIMIT)
+            )
+        committed = _move_staged_artifact(path, destination)
+        moved[key] = committed
+        return committed
+
+    committed_paths = [commit(Path(path)) for path in protected_paths]
+    committed_metadata = [commit(Path(path)) for path in metadata_paths]
+    for track in tracks:
+        key = _path_key(Path(track.path))
+        if key in moved:
+            track.path = moved[key]
+            track.cleanup_paths = []
+            if track.cache_filename and track.path.is_file():
+                _write_completed_track_cache(
+                    track.stream,
+                    track.cache_filename,
+                    args,
+                    track.path,
+                    track.cleanup_paths,
+                )
+    return committed_paths, committed_metadata
+
+
+def _settle_task_workspace(args: argparse.Namespace, *, success: bool) -> None:
+    """Remove staged media while leaving segment caches under their own policy."""
+
+    workspace = getattr(args, "_unidown_task_workspace", None)
+    if workspace is None:
+        return
+    workspace = Path(workspace).expanduser()
+    if not workspace.exists():
+        return
+    if not success and getattr(args, "keep_failed_intermediates", False):
+        message = f"Kept failed intermediates: {workspace}"
+        print(message, file=sys.stderr)
+        _log_line(args, message)
+        return
+    try:
+        shutil.rmtree(windows_long_path(workspace))
+    except OSError as exc:
+        message = f"Task workspace cleanup warning: {workspace} ({exc})"
+        print(message, file=sys.stderr)
+        _log_line(args, message)
+        return
+    if not success:
+        _log_line(args, f"Cleaned failed task workspace: {workspace}")
 
 
 def _legacy_task_temp_root(args: argparse.Namespace, streams, default_save_base: str | None) -> Path:

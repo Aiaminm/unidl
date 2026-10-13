@@ -776,6 +776,7 @@ class SettingsScreen(Screen):
                         "resume_parts",
                         "check_segments_count",
                         "keep_temp",
+                        "keep_failed_intermediates",
                         "delete_temp_after_done",
                         "auto_subtitle_fix",
                         "live_real_time_merge",

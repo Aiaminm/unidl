@@ -24,6 +24,7 @@ import re
 import threading
 import time
 import uuid
+from collections import deque
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -170,13 +171,11 @@ def tracks_panel(save_name: str, tracks: TrackSet) -> Panel:
     do the same nothing. ``1`` and ``^y`` still copy the whole card, which is the
     form this is useful in - a track list pasted into a note.
     """
-    chosen = {id(stream) for stream in tracks.selected}
-    chosen_keys = {key for stream in tracks.selected for key in _track_match_keys(stream)}
+    visible = tracks.selectable_streams
+    chosen = set(_selected_track_indexes(visible, tracks.selected))
     rows: list[str | tuple[str, str]] = []
-    for stream in tracks.selectable_streams:
-        mark = TAKEN if id(stream) in chosen or any(
-            key in chosen_keys for key in _track_match_keys(stream)
-        ) else LEFT
+    for index, stream in enumerate(visible):
+        mark = TAKEN if index in chosen else LEFT
         rows.append(f"{mark}  {stream.format_line()}")
     return Panel(
         title=f"tracks  ·  {save_name}",
@@ -192,7 +191,10 @@ def _track_identity(stream: object) -> tuple[str, ...]:
     """Stable picker identity for merged/service-produced stream instances."""
     return tuple(
         str(getattr(stream, name, "") or "")
-        for name in ("media_type", "id", "group_id", "language", "resolution", "codecs", "bandwidth")
+        for name in (
+            "media_type", "id", "group_id", "language", "resolution", "codecs",
+            "bandwidth", "role", "channels", "video_range", "frame_rate",
+        )
     )
 
 
@@ -205,12 +207,70 @@ def _track_match_keys(stream: object) -> tuple[tuple[str, ...], ...]:
     resolution = str(getattr(stream, "resolution", "") or "")
     codecs = str(getattr(stream, "codecs", "") or "")
     bandwidth = str(getattr(stream, "bandwidth", "") or "")
-    keys = [_track_identity(stream)]
+    variant = tuple(
+        str(getattr(stream, name, "") or "")
+        for name in ("role", "channels", "video_range", "frame_rate")
+    )
+    identity = _track_identity(stream)
+    keys = [("identity", *identity)]
+    url = str(getattr(stream, "url", "") or "")
+    if url:
+        keys.insert(0, ("url", *identity, url))
     if stream_id:
-        keys.append(("id", media_type, stream_id, language, resolution, codecs))
+        keys.append(("id", media_type, stream_id, language, resolution, codecs, *variant))
     if group_id or language or resolution or codecs:
-        keys.append(("shape", media_type, group_id, language, resolution, codecs, bandwidth))
+        keys.append(("shape", media_type, group_id, language, resolution, codecs, bandwidth, *variant))
     return tuple(dict.fromkeys(keys))
+
+
+def _selected_track_indexes(visible: Sequence[object], selected: Sequence[object]) -> list[int]:
+    """Map each selected track to at most one visible row, never all lookalikes.
+
+    Reserve exact objects first. Reconstructed tracks may still match by URL,
+    identity, ID or shape, in that order. Each fallback consumes one unclaimed
+    row in manifest order; a weak match cannot steal another track's exact row.
+    Explicitly selected equivalent renditions remain separate selections.
+    """
+    positions: dict[int, int] = {}
+    for index, stream in enumerate(visible):
+        positions.setdefault(id(stream), index)
+    chosen: set[int] = set()
+    seen: set[int] = set()
+    unmatched: list[object] = []
+    for stream in selected:
+        object_id = id(stream)
+        if object_id in seen:
+            continue
+        seen.add(object_id)
+        index = positions.get(object_id)
+        if index is not None:
+            chosen.add(index)
+        else:
+            unmatched.append(stream)
+    if not unmatched:
+        return sorted(chosen)
+
+    candidates: dict[tuple[str, ...], deque[int]] = {}
+    for index, stream in enumerate(visible):
+        if index not in chosen:
+            for key in _track_match_keys(stream):
+                candidates.setdefault(key, deque()).append(index)
+    pending = [{key[0]: key for key in _track_match_keys(stream)} for stream in unmatched]
+    for kind in ("url", "identity", "id", "shape"):
+        remaining = []
+        for keys in pending:
+            key = keys.get(kind)
+            rows = candidates.get(key) if key is not None else None
+            while rows and rows[0] in chosen:
+                rows.popleft()
+            if rows:
+                chosen.add(rows.popleft())
+            else:
+                remaining.append(keys)
+        pending = remaining
+        if not pending:
+            break
+    return sorted(chosen)
 
 
 _AUDIO_TAG_ROWS = (
@@ -3197,7 +3257,6 @@ class SessionController:
         ctx: FlowContext,
         playback: Playback,
     ) -> list | None:
-        chosen_ids = {id(stream) for stream in tracks.selected}
         visible = tracks.selectable_streams
         choices = [
             Choice(
@@ -3207,12 +3266,7 @@ class SessionController:
             )
             for stream in visible
         ]
-        chosen_keys = {key for stream in tracks.selected for key in _track_match_keys(stream)}
-        preselected = [
-            index for index, stream in enumerate(visible)
-            if id(stream) in chosen_ids
-            or any(key in chosen_keys for key in _track_match_keys(stream))
-        ]
+        preselected = _selected_track_indexes(visible, tracks.selected)
         ask = ctx.pick(
             f"Tracks · {playback.save_name}",
             choices,

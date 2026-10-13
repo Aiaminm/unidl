@@ -1043,6 +1043,18 @@ GLOBAL_SETTINGS: list[Setting] = [
         visible=False,
     ),
     Setting(
+        "keep_failed_intermediates",
+        "Keep failed intermediates",
+        "bool",
+        default=False,
+        help=(
+            "Keep staged video, audio, subtitle and failed mux files in the task "
+            "workspace after a failed delivery for debugging. This does not keep "
+            "segment caches; that is controlled by Keep temporary files."
+        ),
+        visible=False,
+    ),
+    Setting(
         "delete_temp_after_done",
         "Delete temp after success",
         "bool",
@@ -1091,6 +1103,18 @@ GLOBAL_SETTINGS: list[Setting] = [
         "{season} {episode} {year}, and a ? on a field - {episode_name?} - drops it "
         "and one separator when it is empty. The resolution, platform and tag are "
         "added afterwards, by the release template below.",
+        visible=False,
+    ),
+    Setting(
+        "episode_folder_template",
+        "Episode folder layout",
+        "text",
+        default="",
+        help=(
+            "Optional relative folders for episodes. Empty keeps the current flat layout. "
+            "Use {series}, {season}, {season_number}, {year}, {season_episode} and {service}; "
+            "for example {series}/{season}."
+        ),
         visible=False,
     ),
     Setting(

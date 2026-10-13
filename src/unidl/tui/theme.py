@@ -356,6 +356,14 @@ Screen {
     padding: 0 3;
     color: $muted;
 }
+#search-statusline {
+    width: 1fr;
+    height: 1;
+    /* StatusChip contributes two cells of its own padding.  One cell here
+       makes its visible text start at the same column as #masthead's text. */
+    padding: 0 1;
+    align: left middle;
+}
 #crumbs {
     height: 1;
     padding: 0 3;
@@ -775,6 +783,11 @@ DownloadScreen.active-ask #delivery-audio-side {
     width: 1fr;
     height: 1;
     padding: 0 2;
+    align: left middle;
+}
+/* Only the home CDM / DRM / delivery / config row is centered. Page hints
+   and search statistics follow their headings' left edge. */
+HomeScreen #statusline {
     align: center middle;
 }
 .pill {

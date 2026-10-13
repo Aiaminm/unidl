@@ -24,6 +24,7 @@ from textual.widgets.option_list import Option
 
 from ..core import naming, template
 from ..core.i18n import tr
+from ..core.output_paths import render_episode_folder, validate_episode_folder_template
 from ..core.settings import Settings
 from .bidi import visual_markup
 from .chrome import Chrome, KeyBar, refresh_locale_widgets
@@ -35,7 +36,7 @@ from .settings_layout import SettingRow, label_width, setting_row
 class StorageRow:
     key: str
     label: str
-    kind: str  # setting-path | config-path | template | tag | choice | advanced
+    kind: str  # setting-path | config-path | template | folder-template | tag | choice | advanced
     help: str
 
     @property
@@ -83,6 +84,13 @@ _NAMING_ROWS = (
         "Episode file name",
         "template",
         "Fields: title, year, season, episode, season_episode and episode_name.",
+    ),
+    StorageRow(
+        "episode_folder_template",
+        "Episode folder layout",
+        "folder-template",
+        "Empty keeps the flat layout. Examples: {series} or {series}/{season}. "
+        "Fields: series, season, season_number, year, season_episode and service.",
     ),
     StorageRow(
         "name_template_movie",
@@ -322,7 +330,7 @@ class StorageManagerScreen(Screen[None]):
                     if option.value == value:
                         return option.display(), tr("storage.source.settings")
             return str(value or ""), tr("storage.source.settings")
-        if row.kind in {"template", "tag"}:
+        if row.kind in {"template", "folder-template", "tag"}:
             value = str(self.globals.get(row.key) or "")
             return value or tr("value.none"), tr("storage.source.settings")
         return str(getattr(self.app.config.paths, row.key)), tr("storage.read_only")
@@ -400,6 +408,19 @@ class StorageManagerScreen(Screen[None]):
                     timeout=10,
                 )
                 return False
+        if row.kind == "folder-template":
+            problems = validate_episode_folder_template(text)
+            if problems:
+                self.notify(
+                    "  ·  ".join(problems),
+                    title=tr(
+                        "storage.notify.not_saved",
+                        label=tr(f"storage.row.{row.key}", default=row.label),
+                    ),
+                    severity="error",
+                    timeout=10,
+                )
+                return False
         if row.kind in {"setting-path", "config-path"} and text:
             try:
                 text = self._normalise_path(text)
@@ -451,6 +472,10 @@ class StorageManagerScreen(Screen[None]):
             problems = template.validate(str(value or "").strip(), _TEMPLATE_FIELDS[row.key])
             if problems:
                 return f"[$warn]{visual_markup('  ·  '.join(problems))}[/]"
+        if row.kind == "folder-template":
+            problems = validate_episode_folder_template(str(value or "").strip())
+            if problems:
+                return f"[$warn]{visual_markup('  ·  '.join(problems))}[/]"
         return self._name_preview({row.key: value})
 
     def _name_preview(self, changes: dict[str, str] | None = None) -> str:
@@ -462,6 +487,7 @@ class StorageManagerScreen(Screen[None]):
                 "release_template",
                 "release_tag",
                 "filename_style",
+                "episode_folder_template",
             )
         }
         values.update(changes or {})
@@ -488,6 +514,24 @@ class StorageManagerScreen(Screen[None]):
             Title("example-movie", TitleKind.MOVIE, "Example Movie", year="2026"),
             templates,
         )
+        try:
+            folder = "/".join(
+                render_episode_folder(
+                    values["episode_folder_template"],
+                    Title(
+                        "example-episode",
+                        TitleKind.EPISODE,
+                        "Example Show",
+                        year="2026",
+                        season=1,
+                        episode=2,
+                        episode_name="The Example",
+                    ),
+                    "example-service",
+                )
+            ) or tr("storage.preview.flat")
+        except ValueError as exc:
+            folder = str(exc)
         suffix = naming.release_suffix(
             quality="1080p",
             platform="SERVICE",
@@ -503,7 +547,8 @@ class StorageManagerScreen(Screen[None]):
         )
         return (
             f"[$dim]{tr('storage.preview.episode')}[/]  {visual_markup(episode + suffix)}\n"
-            f"[$dim]{tr('storage.preview.film')}[/]     {visual_markup(movie + suffix)}"
+            f"[$dim]{tr('storage.preview.film')}[/]     {visual_markup(movie + suffix)}\n"
+            f"[$dim]{tr('storage.preview.folder')}[/]  {visual_markup(folder)}"
         )
 
     def go_back(self) -> bool:

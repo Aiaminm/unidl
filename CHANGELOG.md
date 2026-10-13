@@ -1,5 +1,21 @@
 # Changelog
 
+## [2.3.8] - 2026-10-13
+
+### Download reliability
+
+- Isolated each title's intermediate files and cleaned failed or cancelled outputs without removing resumable segment caches.
+- Added optional episode-folder layouts under the service download directory while preserving the existing flat layout by default.
+
+### Track selection and search
+
+- Made rebuilt and equivalent tracks map one-to-one during automatic selection and manual track-picker recovery.
+- Aligned Search page status information with its heading while keeping the home status row centered.
+
+### Services
+
+- Added ITVX, Channel 4, Channel 5, Eternal Family, KVIFF.TV and DAFilms to the public service set.
+
 ## [2.3.7] - 2026-10-11
 
 ### Batch downloads

@@ -163,6 +163,9 @@ class DownloadOptions(ParseOptions):
     no_color: bool = True
     keep_temp: bool = False
     no_del_after_done: bool = False
+    #: Preserve staged media files only when the task fails. This does not alter
+    #: the segment-cache policy controlled by ``keep_temp``.
+    keep_failed_intermediates: bool = False
 
     # live
     is_live: bool = False
@@ -269,6 +272,8 @@ class DownloadOptions(ParseOptions):
             argv.append("--keep-temp")
         if self.no_del_after_done:
             argv.append("--no-del-after-done")
+        if self.keep_failed_intermediates:
+            argv.append("--keep-failed-intermediates")
 
         if self.proxy:
             argv += ["--custom-proxy", self.proxy]

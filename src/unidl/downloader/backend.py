@@ -886,6 +886,7 @@ class NativeDownloaderBackend:
             no_color=policy.no_color,
             keep_temp=policy.keep_temp,
             no_del_after_done=policy.keep_after_done,
+            keep_failed_intermediates=policy.keep_failed_intermediates,
             is_live=live.enabled,
             live_record_limit=live.record_limit,
             live_real_time_merge=live.real_time_merge,

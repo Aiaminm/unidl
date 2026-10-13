@@ -198,6 +198,9 @@ class DownloadPolicy:
     write_meta_json: bool = False
     keep_temp: bool = False
     keep_after_done: bool = False
+    #: Keep staged media files after failure for debugging. This is separate
+    #: from ``keep_temp``, which controls resumable segment caches.
+    keep_failed_intermediates: bool = False
     no_color: bool = True
     live: LivePolicy = field(default_factory=LivePolicy)
 

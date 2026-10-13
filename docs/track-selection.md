@@ -22,6 +22,20 @@ already-returned ladder; it does not make a service fetch a 1080p manifest.
 Services must keep their provider/API/profile settings separate from these
 output settings.
 
+### Equal-ranked tracks
+
+Best selection keeps only one track per requested selection group, even when
+several renditions have identical parameters. Exact ranking ties keep the first
+track in manifest order. The track picker and track preview preserve that single
+selection instead of checking every row with matching metadata. Rebuilt tracks
+are matched one-to-one, so a renewed source URL does not expand the selection.
+
+This does not remove tracks from the ladder. All matching mode still selects all
+matching renditions, and users can manually select multiple equivalent tracks.
+Multiple requested audio/subtitle languages and video profiles retain their
+existing selection groups; this rule does not reduce the whole download to one
+track of each type.
+
 ## Output scope
 
 `output_scope` controls which media types participate in automatic selection:

@@ -691,6 +691,7 @@ class DownloadScreen(AskHost):
                 downloads = engine.save_dir(
                     self.controller.settings,
                     getattr(self.controller.service, "ID", ""),
+                    title=playback.title,
                 )
             except Exception:
                 paths = getattr(getattr(engine, "config", None), "paths", None)
