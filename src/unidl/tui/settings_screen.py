@@ -764,7 +764,6 @@ class SettingsScreen(Screen):
                     "settings.group.download_help",
                     (
                         "after_resolve",
-                        "fetch_actual_bitrate",
                         "live_record",
                         "confirm_batch",
                         "retries",

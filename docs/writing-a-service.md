@@ -175,14 +175,24 @@ For a scan-to-sign-in challenge, pass a `QrPresentation` from
 the QR; the presenter generates a sharp bitmap locally. Use `image_data=` only
 when the service returns an image as bytes or a base64 `data:image/...` URI.
 `image_url=` may name an official, public HTTPS QR bitmap returned by the
-provider. When both `image_url=` and `payload=` are present, the official bitmap
-is rendered first and the payload is the local fallback. `image_data=` remains
+provider. When an official image is supplied, it is authoritative: the presenter
+never replaces it with a QR generated from `payload=`, even if fetching or
+rendering the image fails. The image may encode a session URL that differs from
+the ordinary browser activation page. `image_data=` remains
 the preferred option for protected images: fetch those through the service's own
 API session before constructing the presentation so the TUI does not bypass
 cookies, headers, or a service proxy. `fallback_url=` is the ordinary HTTP(S)
 address opened when the terminal cannot display images. Older service adapters
 may put a clearly named QR image endpoint in `fallback_url=`; the public QR
-layer recognises those endpoints for compatibility.
+layer recognises those endpoints for compatibility. Clearly named image URLs
+and image data URIs in `payload=` are also treated as images.
+
+Image-capable terminals display the provider bitmap. Other terminals preserve
+its module grid, including inverted (light-on-dark) codes, with a four-module
+quiet zone. The original image can also be opened using **Open QR image**.
+If the terminal is too narrow for the full grid, a prompt replaces the clipped
+code; widen the window or open the image. No login payload is written to logs,
+and the temporary preview is removed when the login prompt closes.
 
 ```python
 challenge = client.start_qr_login()
@@ -193,7 +203,7 @@ session = yield ctx.wait_for(
     qr=QrPresentation(
         payload=challenge.url,
         image_url=challenge.image_url,
-        fallback_url=challenge.image_url,
+        fallback_url=challenge.url,
         alt="Example TV login QR",
     ),
 )
@@ -417,6 +427,16 @@ only its first PSSH in the service. Core filters PlayReady protection data,
 deduplicates raw PSSH and equivalent WRM/KID identities, performs one independent
 licence exchange per remaining identity and merges the keys. Most services happen
 to produce one key; that observation is not permission to hard-code one PSSH.
+
+With **License after track selection** enabled, Core narrows DASH protection
+data to the final encrypted representations/KIDs before collecting PlayReady
+objects. Unselected MPD headers, including stale headers already in the playback
+context, must not add licence requests or vault requirements. If the selected
+representations cannot be mapped safely, inspect only their initialization
+segments; never silently revert to a full-MPD licence scan. A shared multi-KID
+WRM header stays intact, but only selected KIDs drive completion. These rules
+apply equally to local and remote CDMs; disabling the option retains the
+default full-inventory behaviour.
 
 Keep verified service-specific behaviour instead of mechanically applying that
 default. If an HLS master omits per-track PSSH data, use the service's separately

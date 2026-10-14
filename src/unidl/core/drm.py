@@ -599,6 +599,11 @@ def _playready_headers(exchange: Exchange) -> list[str]:
             *(exchange.drm.context.get("wrm_headers") or []),
         ]
     )
+    if exchange.drm.context.get("license_inventory_mode") == "selected":
+        headers = playready.headers_for_kids(
+            headers, exchange.drm.context.get("license_track_kids") or [],
+            keep_unknown=bool(exchange.drm.context.get("selected_license_pssh")),
+        )
     unique: list[str] = []
     seen: set[frozenset[str]] = set()
     for header in headers:
@@ -626,6 +631,8 @@ def _playready_wanted_kids(exchange: Exchange, headers: Iterable[str]) -> set[st
         playready.canonical_kid(kid)
         for kid in (exchange.drm.context.get("license_track_kids") or [])
     }
+    if exchange.drm.context.get("license_inventory_mode") == "selected" and wanted - {""}:
+        return wanted - {""}
     for header in headers:
         wanted.update(playready.key_ids_from_header(header))
     return {kid for kid in wanted if kid}
@@ -676,6 +683,8 @@ def _collect_playready_keys(
     throttled = False
     try:
         for index, header in enumerate(headers, 1):
+            if wanted and wanted <= set(keys):
+                break
             kids = playready.key_ids_from_header(header)
             if kids and all(kid in keys for kid in kids):
                 exchange.log(
@@ -788,9 +797,42 @@ def _playready_remote_keys(exchange: Exchange) -> list[str]:
     )
 
 
+def scope_playready_init_data(drm: DrmInfo) -> None:
+    """Remove stale full-ladder init data before a selected-only PR exchange."""
+    if drm.context.get("license_inventory_mode") != "selected":
+        return
+    from . import playready
+
+    wanted = drm.context.get("license_track_kids") or []
+    trusted = bool(drm.context.get("selected_license_pssh"))
+    headers = playready.headers_for_kids(
+        _distinct([drm.wrm_header, *(drm.context.get("wrm_headers") or [])]),
+        wanted, keep_unknown=trusted,
+    )
+    drm.wrm_header = headers[0] if headers else None
+    drm.context["wrm_headers"] = headers
+    objects = []
+    for blob in drm.context.get("playready_psshs") or []:
+        try:
+            declared = playready.wrm_headers_from_pssh(blob)
+        except Exception:  # noqa: BLE001 - unreadable optional objects cannot prove ownership
+            declared = []
+        if playready.headers_for_kids(declared, wanted, keep_unknown=trusted):
+            objects.append(blob)
+    drm.context["playready_psshs"] = _distinct(objects)
+
+
 def _playready_extract(manifest: bytes | str, drm: DrmInfo, log) -> str | None:
     from . import playready
 
+    selected = drm.context.get("license_inventory_mode") == "selected"
+    if selected:
+        scoped = playready.dash_manifest_for_tracks(
+            manifest, drm.context.get("license_tracks") or [],
+        )
+        if scoped is not None:
+            manifest = scoped
+        scope_playready_init_data(drm)
     # pyplayready's own parser first: DASH and Smooth Streaming both carry a
     # base64 PlayReady object, not the header verbatim. Unpacking it by hand is
     # how you end up with a header the CDM will not accept.
@@ -801,27 +843,49 @@ def _playready_extract(manifest: bytes | str, drm: DrmInfo, log) -> str | None:
         objects = playready.playready_objects_from_hls(manifest)
         from_hls = bool(objects)
 
-    known_objects = _distinct(
-        [*(drm.context.get("playready_psshs") or []), *objects]
-    )
-    if known_objects:
-        # Preserve the deduplicated source objects as well as their parsed WRM
-        # headers. This makes repeated init segments cheap and keeps the public
-        # state faithful to the "one request per unique PSSH" rule.
-        drm.context["playready_psshs"] = known_objects
-
     parsed_headers: list[str] = []
+    accepted_objects: list[str] = []
     for blob in _distinct(objects):
         try:
-            parsed_headers.extend(playready.wrm_headers_from_pssh(blob))
+            headers = playready.wrm_headers_from_pssh(blob)
+            if selected:
+                headers = playready.headers_for_kids(
+                    headers, drm.context.get("license_track_kids") or [], keep_unknown=True,
+                )
+            if headers:
+                accepted_objects.append(blob)
+                parsed_headers.extend(headers)
         except Exception as exc:  # noqa: BLE001
             log(f"skipping a PlayReady PSSH: {exc}")
+            # Preserve the existing KID-only PlayReady fallback per object in
+            # selected mode, not just for the MPD's first header. The fallback
+            # only uses KIDs actually declared by a PlayReady v1 PSSH.
+            if selected:
+                headers = playready.wrm_headers_from_kid_only_pssh(blob)
+                headers = playready.headers_for_kids(
+                    headers, drm.context.get("license_track_kids") or [], keep_unknown=True,
+                )
+                if headers:
+                    accepted_objects.append(blob)
+                    parsed_headers.extend(headers)
     if from_hls and parsed_headers:
         log("PlayReady: object taken from the playlist's key line")
     if not parsed_headers:
         single = playready.wrm_header_from_mpd(manifest)
         parsed_headers = [single] if single else []
+        if selected:
+            parsed_headers = playready.headers_for_kids(
+                parsed_headers, drm.context.get("license_track_kids") or [], keep_unknown=True,
+            )
+        if single:
+            log("PlayReady: recovered WRM header from manifest metadata")
 
+    known_objects = _distinct([
+        *(drm.context.get("playready_psshs") or []),
+        *(accepted_objects if selected else objects),
+    ])
+    if known_objects:
+        drm.context["playready_psshs"] = known_objects
     before = len(drm.context.get("wrm_headers") or [])
     headers = _distinct(
         [
@@ -833,6 +897,8 @@ def _playready_extract(manifest: bytes | str, drm: DrmInfo, log) -> str | None:
     if headers:
         drm.wrm_header = headers[0]
         drm.context["wrm_headers"] = headers
+        if selected:
+            drm.context["selected_license_pssh"] = True
     # Counts are cumulative: this runs once per document - the master playlist, each
     # selected media playlist, each representation's init segment - so saying it
     # again unchanged only reads as a repeat of the same finding.

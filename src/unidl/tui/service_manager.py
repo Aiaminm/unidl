@@ -132,6 +132,91 @@ class _AttachmentPolicyScreen(ModalScreen[None]):
         return True
 
 
+class _BitratePolicyScreen(ModalScreen[None]):
+    """Choose a global probe default and independent service overrides."""
+
+    BINDINGS = [
+        Binding("escape", "cancel", "Cancel", show=False),
+        Binding("ctrl+b", "cancel", "Back", show=False),
+        Binding("r", "reset", "Reset", show=False),
+    ]
+
+    def __init__(self, app) -> None:
+        super().__init__()
+        self.globals = app.globals
+        self.services = sorted(app.services, key=lambda cls: cls.NAME.casefold())
+        spec = next(spec for spec in service_license_settings() if spec.key == "fetch_actual_bitrate")
+        self.scopes = [
+            Settings(cls.ID, [spec], app.settings_store, parent=app.globals, legacy_ids=cls.LEGACY_IDS)
+            for cls in self.services
+        ]
+
+    def compose(self) -> ComposeResult:
+        yield Chrome(show_search=False, show_settings=False)
+        with Vertical(id="modal-body"):
+            yield Static(tr("service.bitrate.title"), classes="ask-title")
+            yield Label(tr("service.bitrate.help"), id="service-bitrate-help", classes="ask-hint")
+            yield OptionList(id="service-bitrate-list")
+        yield KeyBar(("enter", "toggle"), ("r", "reset"), ("^b", "back"), ("esc", "back"))
+
+    def on_mount(self) -> None:
+        self.rebuild()
+        self._fit_help()
+        self.query_one("#service-bitrate-list", OptionList).focus()
+
+    def on_resize(self) -> None:
+        self._fit_help()
+
+    def _fit_help(self) -> None:
+        found = self.query("#service-bitrate-help")
+        if found:
+            hint = found.first(Label)
+            # Override the shared single-line ask hint with responsive prose.
+            hint.styles.width = "1fr"
+            hint.styles.height = "auto"
+            hint.styles.max_height = max(2, min(8, self.app.size.height - 7))
+
+    def rebuild(self) -> None:
+        options = self.query_one("#service-bitrate-list", OptionList)
+        previous = options.highlighted
+        options.clear_options()
+        labels = [tr("service.bitrate.global"), *(cls.NAME for cls in self.services)]
+        width = label_width(labels)
+        spec = self.globals.spec_by_key["fetch_actual_bitrate"]
+        value = setting_value(spec, self.globals)
+        options.add_option(Option(setting_row(options, labels[0], f"[$accent]{value}[/]", width), id="@global"))
+        for cls, settings in zip(self.services, self.scopes, strict=True):
+            value = setting_value(settings.spec_by_key["fetch_actual_bitrate"], settings)
+            source = "settings.service_override" if settings.has_override("fetch_actual_bitrate") else "settings.follows_global"
+            row = setting_row(options, cls.NAME, f"[$accent]{value}[/]  [$dim]{tr(source)}[/]", width)
+            options.add_option(Option(row, id=cls.ID))
+        if not self.services:
+            options.add_option(Option(tr("service.export.empty"), disabled=True))
+        options.highlighted = min(previous or 0, len(self.services))
+
+    def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
+        event.stop()
+        index = event.option_index
+        if 0 <= index <= len(self.services):
+            settings = self.globals if index == 0 else self.scopes[index - 1]
+            settings.set("fetch_actual_bitrate", not bool(settings.get("fetch_actual_bitrate")))
+            self.rebuild()
+
+    def action_reset(self) -> None:
+        index = self.query_one("#service-bitrate-list", OptionList).highlighted
+        if index is not None and 0 <= index <= len(self.services):
+            settings = self.globals if index == 0 else self.scopes[index - 1]
+            settings.clear("fetch_actual_bitrate")
+            self.rebuild()
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+    def go_back(self) -> bool:
+        self.dismiss(None)
+        return True
+
+
 class _RegistrationEditor(ModalScreen[str | None]):
     BINDINGS = [Binding("escape", "cancel", "Cancel", show=False), Binding("ctrl+b", "cancel", "Back", show=False)]
 
@@ -307,7 +392,7 @@ class ServicesManagerScreen(Screen[None]):
     def __init__(self, globals_scope: Settings):
         super().__init__()
         self.globals = globals_scope
-        self._rows = ("chapters", "attachments", "license", "hybrid", "register", "home", "export")
+        self._rows = ("chapters", "attachments", "bitrate", "license", "hybrid", "register", "home", "export")
         self._sources = []
 
     def compose(self) -> ComposeResult:
@@ -358,6 +443,7 @@ class ServicesManagerScreen(Screen[None]):
         rows = [
             ("chapters", tr('service.chapters.action', default='Chapter metadata by service'), f"[$dim]{tr('service.chapters.summary', default='Independent on/off per registered service')}[/]"),
             ("attachments", tr('service.attachments.action', default='Title attachments by service'), f"[$dim]{tr('service.attachments.summary', default='Independent on/off per registered service')}[/]"),
+            ("bitrate", tr("service.bitrate.action"), f"[$dim]{tr('service.bitrate.summary')}[/]"),
             ("license", tr('service.license.action', default='License after final track selection'), f"[$dim]{setting_value(self.globals.spec_by_key['license_after_tracks'], self.globals)}[/]"),
             ("hybrid", tr('service.hybrid.action', default='Dolby Vision + HDR10 hybrid output'), f"[$dim]{setting_value(self.globals.spec_by_key['dolby_vision_hybrid'], self.globals)}[/]"),
             ("register", tr('service.register.action'), f"[$dim]{tr('service.register.summary', registered=count, available=len(self._sources))}[/]"),
@@ -378,6 +464,7 @@ class ServicesManagerScreen(Screen[None]):
         keys = {
             "chapters": "service.chapters.help",
             "attachments": "service.attachments.help",
+            "bitrate": "service.bitrate.help",
             "license": "service.license.help",
             "hybrid": "service.hybrid.help",
             "register": "service.register.help",
@@ -403,6 +490,9 @@ class ServicesManagerScreen(Screen[None]):
             return
         if ident == "attachments":
             self.app.push_screen(_AttachmentPolicyScreen(self.app), lambda _result: self.rebuild())
+            return
+        if ident == "bitrate":
+            self.app.push_screen(_BitratePolicyScreen(self.app), lambda _result: self.rebuild())
             return
         if ident == "license":
             spec = self.globals.spec_by_key["license_after_tracks"]

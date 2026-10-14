@@ -1272,15 +1272,28 @@ class Engine:
             return None
         wanted = drm.system or WIDEVINE
         system = drm_registry.get(wanted)
+        if wanted == drm_registry.PLAYREADY and drm.context.get("license_inventory_mode") == "selected":
+            drm_registry.scope_playready_init_data(drm)
         existing = drm_registry.init_data_for(drm, wanted)
         existing_headers = drm.context.get("wrm_headers") or []
         init_scan_marker = f"init_data_scanned_{wanted}"
+        needs_more_headers = len(existing_headers) <= 1
+        if wanted == drm_registry.PLAYREADY and drm.context.get("license_inventory_mode") == "selected":
+            from . import playready
+
+            expected = {
+                playready.canonical_kid(str(kid))
+                for kid in drm.context.get("license_track_kids") or []
+            } - {""}
+            covered = set(self._drm_key_ids(playback))
+            if expected:
+                needs_more_headers = not expected <= covered
         needs_playready_collection = bool(
             existing
             and system is not None
             and system.collect_init_segments
             and tracks is not None
-            and len(existing_headers) <= 1
+            and needs_more_headers
             and not drm.context.get(init_scan_marker)
         )
         if existing and not needs_playready_collection:
@@ -1310,7 +1323,16 @@ class Engine:
             raise CdmError(f"Could not fetch manifest: {exc}") from exc
 
         resolved = system.extract(manifest, drm, self.log)
-        if resolved or tracks is None:
+        missing_selected_headers = False
+        if wanted == drm_registry.PLAYREADY and drm.context.get("license_inventory_mode") == "selected":
+            expected = {
+                playready.canonical_kid(str(kid))
+                for kid in drm.context.get("license_track_kids") or []
+            } - {""}
+            missing_selected_headers = bool(expected - set(self._drm_key_ids(playback)))
+        if (resolved and not missing_selected_headers) or tracks is None:
+            if resolved and system.collect_init_segments:
+                drm.context[init_scan_marker] = True
             return resolved
 
         self.log("Fetching initialization segment for DRM init data")
@@ -1566,6 +1588,11 @@ class Engine:
             if not selected_only or playback.drm.context.get("selected_license_pssh")
             else []
         )
+        if selected_only and inventory_kids and playback.drm.system == drm_registry.PLAYREADY:
+            # A selected header may legitimately carry multiple KIDs. Its
+            # unselected keys do not expand this download's vault requirement.
+            wanted_kids = {normalize_hex(value) for value in inventory_kids}
+            extra_kids = [value for value in extra_kids if normalize_hex(value) in wanted_kids]
         for value in [*inventory_kids, *extra_kids]:
             kid = normalize_hex(value)
             if kid and kid not in kids:
@@ -2062,6 +2089,18 @@ class Engine:
             drm.context["license_track_kids"] = list(
                 dict.fromkeys([*known_kids, *self.downloader.key_ids(inventory)])
             )
+            if drm.system == drm_registry.PLAYREADY:
+                scope = (
+                    drm.context["license_inventory_mode"],
+                    tuple(id(stream) for stream in inventory),
+                    tuple(drm.context["license_track_kids"]),
+                )
+                previous = drm.context.get("playready_init_scope")
+                if previous != scope:
+                    drm.context.pop("init_data_scanned_playready", None)
+                    if previous is not None:
+                        drm.context.pop("selected_license_pssh", None)
+                    drm.context["playready_init_scope"] = scope
 
         if service.USES.is_self("drm"):
             # A foreign export is a completed delivery handoff, not a service
@@ -4094,6 +4133,7 @@ class Engine:
         pause: threading.Event | None = None,
         *,
         service=None,
+        stop_recording: threading.Event | None = None,
     ) -> DownloadResult:
         """Execute the native download through structured host callbacks.
 
@@ -4102,6 +4142,8 @@ class Engine:
         ordinary messages no longer require process-wide stdout/stderr capture.
         ``pause`` holds workers between segments without ending the job; the
         same run continues when it is cleared.
+        ``stop_recording`` ends only live capture, allowing its normal mux and
+        output commit to finish. It never stops VOD or shuts down the runtime.
         """
         command = self.command_for(playback, settings, tracks, service=service)
         debug_recorder = None
@@ -4221,6 +4263,9 @@ class Engine:
                 emit=publish_event,
                 request_live_key=supply_live_key,
                 display_width=lambda: self.frame_columns,
+                stop_recording_requested=(
+                    stop_recording.is_set if stop_recording is not None else None
+                ),
             )
             delivery = self.downloader.run(plan, delivery_hooks)
             if delivery.status is DeliveryStatus.SUCCEEDED:

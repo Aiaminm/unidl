@@ -290,6 +290,16 @@ class NativeHttpClient:
             self._pools.clear()
             connections = list(self._connections)
             self._connections.clear()
+        # HTTPResponse owns a buffered socket reader. Closing the connection's
+        # socket alone may leave that reader's reference alive, then block in
+        # response.close() waiting for its read lock. Interrupt reads first.
+        for connection in connections:
+            sock = getattr(connection, "sock", None)
+            if sock is not None:
+                try:
+                    sock.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
         for pool in pools:
             while pool:
                 self._discard(pool.pop())

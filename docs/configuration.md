@@ -104,7 +104,12 @@ finished artifacts to the destination folder. A failed or cancelled task
 removes that workspace by default, so partial files do not accumulate beside
 completed downloads. `keep_failed_intermediates` can be enabled when debugging
 to retain that failed workspace; it is independent from `keep_temp`, which
-controls resumable segment caches.
+controls resumable segment caches. This staging cleanup applies to VOD, not
+captured live recordings. A real-time live mux writes its growing file visibly
+in the service download folder; separate live tracks use a visible
+`<name>.recording/` folder. Back finishes and commits the recording normally,
+then cleans superseded tracks. Quit or a failed finish keeps already-written
+recordings without starting additional processing.
 
 Core creates directories on demand and applies owner-only permissions to
 credential, device, key and log state where the operating system supports them.

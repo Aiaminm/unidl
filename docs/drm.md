@@ -64,6 +64,15 @@ KIDs/PSSH, including init data discovered in media playlists. Unselected
 renditions do not expand that inventory. It does not let service code read shared
 output settings to choose an API or endpoint.
 
+For DASH PlayReady in this selected mode, Core maps the final encrypted tracks
+to the MPD's representations and filters their PSSH/PRO/WRM data before licensing.
+Unselected headers already cached in the playback context are excluded too.
+Missing init data is read only from selected initialization segments; Core does
+not fall back to licensing the complete MPD. A shared multi-KID WRM header is
+sent unchanged, but unrelated KIDs do not expand vault coverage or trigger extra
+requests. The same scope applies to local and remote CDMs. With the option off,
+the default full-manifest inventory remains unchanged.
+
 ## PlayReady PSSH and KID handling
 
 For a normal DASH or Smooth Streaming PlayReady service, the default contract

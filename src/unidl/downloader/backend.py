@@ -69,11 +69,11 @@ class NativeDownloaderBackend:
         self._active_runtime: DownloadRuntime | None = None
 
     def shutdown_active_download(self) -> None:
-        """Hard-stop the currently embedded delivery, if there is one."""
+        """Signal a hard stop without blocking the caller on resource cleanup."""
         with self._runtime_lock:
             runtime = self._active_runtime
         if runtime is not None:
-            runtime.shutdown()
+            runtime.request_shutdown()
 
     def _forget_runtime(self, runtime: DownloadRuntime) -> None:
         with self._runtime_lock:
@@ -712,6 +712,11 @@ class NativeDownloaderBackend:
             display_width=hooks.display_width,
             console_progress=False,
             console_output=False,
+            stop_recording_requested=(
+                hooks.stop_recording_requested
+                if plan.policy.live.enabled and not plan.policy.live.perform_as_vod
+                else None
+            ),
         )
         try:
             with runtime.activate():
@@ -723,7 +728,7 @@ class NativeDownloaderBackend:
                 )
         except (api.DownloadCancelled, KeyboardInterrupt):
             self._forget_runtime(runtime)
-            return DeliveryResult(DeliveryStatus.CANCELLED, exit_code=130)
+            return DeliveryResult(DeliveryStatus.CANCELLED, tuple(artifacts), exit_code=130)
         except SystemExit as exc:
             self._forget_runtime(runtime)
             value = exc.code
@@ -734,9 +739,10 @@ class NativeDownloaderBackend:
             else:
                 exit_code = 1
             if exit_code == 0:
-                return DeliveryResult(DeliveryStatus.SUCCEEDED, exit_code=0)
+                return DeliveryResult(DeliveryStatus.SUCCEEDED, tuple(artifacts), exit_code=0)
             return DeliveryResult(
                 DeliveryStatus.FAILED,
+                tuple(artifacts),
                 failure=DeliveryFailure(
                     DeliveryStage.DOWNLOADING,
                     str(value or f"Downloader exited with code {exit_code}"),
@@ -747,9 +753,10 @@ class NativeDownloaderBackend:
         except Exception as exc:  # implementation exceptions become Core data
             self._forget_runtime(runtime)
             if hooks.cancellation.cancelled or runtime.stopped:
-                return DeliveryResult(DeliveryStatus.CANCELLED, exit_code=130)
+                return DeliveryResult(DeliveryStatus.CANCELLED, tuple(artifacts), exit_code=130)
             return DeliveryResult(
                 DeliveryStatus.FAILED,
+                tuple(artifacts),
                 failure=DeliveryFailure(
                     DeliveryStage.DOWNLOADING,
                     str(exc),
@@ -759,10 +766,11 @@ class NativeDownloaderBackend:
             )
         self._forget_runtime(runtime)
         if exit_code == 130 or hooks.cancellation.cancelled or runtime.stopped:
-            return DeliveryResult(DeliveryStatus.CANCELLED, exit_code=130)
+            return DeliveryResult(DeliveryStatus.CANCELLED, tuple(artifacts), exit_code=130)
         if exit_code != 0:
             return DeliveryResult(
                 DeliveryStatus.FAILED,
+                tuple(artifacts),
                 failure=DeliveryFailure(
                     DeliveryStage.DOWNLOADING,
                     f"Downloader exited with code {exit_code}",

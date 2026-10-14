@@ -1168,8 +1168,7 @@ TextWidget {
 /* Half-block QR is one module per column. Grow with the code rather than
    wrapping modules, which would break the finder/timing grid a camera needs. */
 .manual-card.qr-card {
-    width: auto;
-    min-width: 78;
+    width: 78;
 }
 /* the field belongs inside the card when the card is what it is answering, and
    as wide as the values above it rather than as wide as its own placeholder */
@@ -1269,6 +1268,19 @@ TextWidget {
     height: auto;
     color: $warn;
     text-align: center;
+}
+.qr-open-image {
+    width: auto;
+    min-width: 0;
+    height: 1;
+    padding: 0 1;
+    margin: 1 0 0 0;
+    border: none;
+    background: $highlight;
+    color: $manifest;
+}
+.qr-open-image:hover {
+    background: $visual;
 }
 
 /* sits under the list it narrows, with a row of air between them */

@@ -32,7 +32,7 @@ import binascii
 import importlib.util
 import re
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Iterable, Sequence
 from pathlib import Path
 
 INSTALL_HINT = (
@@ -177,6 +177,18 @@ def _minimal_wrm_header(kid: str) -> str:
     )
 
 
+def wrm_headers_from_kid_only_pssh(value: str) -> list[str]:
+    """Standards fallback for a PlayReady v1 box with declared KIDs only."""
+    kids = _kids_from_playready_object(value)
+    if not kids:
+        return []
+    raw = base64.b64decode(value + "=" * (-len(value) % 4))
+    offset = 32 + int.from_bytes(raw[28:32], "big") * 16
+    if offset + 4 > len(raw) or int.from_bytes(raw[offset:offset + 4], "big") != 0:
+        return []  # Do not replace a malformed provider-owned payload with invented XML.
+    return [_minimal_wrm_header(kid) for kid in kids]
+
+
 #: The SOAPAction every PlayReady licence server expects. Without it most return
 #: 500 with an empty body, which reads like a network fault rather than a missing
 #: header, so it is set for services rather than left to each of them.
@@ -273,6 +285,110 @@ def key_ids_from_header(header: str) -> list[str]:
         if kid and kid not in found:
             found.append(kid)
     return found
+
+
+def headers_for_kids(
+    headers: Iterable[str], kids: Iterable[str], *, keep_unknown: bool = False
+) -> list[str]:
+    """Keep original WRM headers that cover the requested canonical KIDs.
+
+    Never rewrite a multi-key header: its original bytes may be signed or part
+    of the provider's challenge contract. A shared header is one valid request,
+    but its other KIDs must not expand the selected-track coverage requirement.
+    """
+    wanted = {canonical_kid(str(kid)) for kid in kids} - {""}
+    found: list[str] = []
+    for header in headers:
+        text = str(header or "").strip()
+        if not text or text in found:
+            continue
+        declared = set(key_ids_from_header(text))
+        if (wanted and declared & wanted) or (keep_unknown and (not wanted or not declared)):
+            found.append(text)
+    return found
+
+
+def dash_manifest_for_tracks(
+    manifest: str | bytes, tracks: Sequence[object]
+) -> bytes | None:
+    """An in-memory DASH init-data view containing only selected representations.
+
+    This does not edit the playback manifest or fetch media. Parser identities
+    and declared KIDs associate representations with the selected inventory;
+    if neither can prove an association, Core must use the selected init segment
+    rather than fall back to unrelated MPD protection objects. Non-DASH inputs
+    return None so HLS/ISM keep their own extraction path.
+    """
+    from xml.etree import ElementTree as ET
+
+    try:
+        root = ET.fromstring(manifest)
+    except ET.ParseError:
+        return None
+    if root.tag.rsplit("}", 1)[-1] != "MPD":
+        return None
+
+    def children(node, name):
+        return [child for child in node if child.tag.rsplit("}", 1)[-1] == name]
+
+    def track_kids(track):
+        extra = getattr(track, "extra", {}) or {}
+        values = [extra.get("key_id"), *(extra.get("key_ids") or [])]
+        values.extend(getattr(segment, "key_id", None) for segment in getattr(track, "segments", ()))
+        return {canonical_kid(str(value or "")) for value in values} - {""}
+
+    def protection_kids(node):
+        found = set()
+        for protection in children(node, "ContentProtection"):
+            for attr, value in protection.attrib.items():
+                if attr.rsplit("}", 1)[-1].lower() == "default_kid":
+                    found.update(canonical_kid(kid) for kid in re.split(r"[\s,]+", value))
+        return found - {""}
+
+    inventory = []
+    for track in tracks:
+        if str(getattr(track, "manifest_type", "")).lower() != "dash":
+            continue
+        extra = getattr(track, "extra", {}) or {}
+        period_ids = extra.get("period_ids") or [extra.get("period_id")]
+        inventory.append((
+            {str(value) for value in period_ids if value is not None},
+            str(extra.get("dash_adaptation_id") or ""),
+            str(getattr(track, "id", "") or ""),
+            track_kids(track),
+        ))
+
+    periods = children(root, "Period") or [root]
+    for index, period in enumerate(periods):
+        period_id = period.get("id") or str(index)
+        for adaptation in children(period, "AdaptationSet"):
+            representations = children(adaptation, "Representation")
+            kept = []
+            for representation in representations or [adaptation]:
+                declared = protection_kids(representation) or protection_kids(adaptation)
+                for period_ids, adaptation_id, representation_id, known in inventory:
+                    if period_ids and period_id not in period_ids:
+                        continue
+                    if known and declared:
+                        matches = bool(known & declared)
+                    else:
+                        matches = (
+                            (not adaptation_id or adaptation_id == adaptation.get("id"))
+                            and bool(representation.get("id"))
+                            and representation.get("id") == representation_id
+                        )
+                    if matches:
+                        kept.append(representation)
+                        break
+            if not kept:
+                period.remove(adaptation)
+            else:
+                for representation in representations:
+                    if representation not in kept:
+                        adaptation.remove(representation)
+        if period is not root and not children(period, "AdaptationSet"):
+            root.remove(period)
+    return ET.tostring(root, encoding="utf-8")
 
 
 #: PlayReady's HLS key format. One name, unlike Widevine's urn, but still written
@@ -412,6 +528,8 @@ __all__ = [
     "available",
     "canonical_kid",
     "get_keys",
+    "dash_manifest_for_tracks",
+    "headers_for_kids",
     "is_device",
     "key_ids_from_header",
     "playready_objects_from_manifest",
@@ -420,4 +538,5 @@ __all__ = [
     "soap_headers",
     "wrm_header_from_mpd",
     "wrm_headers_from_pssh",
+    "wrm_headers_from_kid_only_pssh",
 ]

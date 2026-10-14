@@ -6,9 +6,11 @@ import os
 import re
 import select
 import sys
+import tempfile
 import time
 from collections.abc import Mapping
 from functools import lru_cache
+from pathlib import Path
 
 try:  # iTerm2 is macOS-only; keep importing the TUI on Windows.
     import termios
@@ -17,11 +19,15 @@ except ImportError:  # pragma: no cover - platform-specific
     termios = None  # type: ignore[assignment]
     tty = None  # type: ignore[assignment]
 
+from rich.segment import Segment
 from rich.style import Style
 from rich.text import Text
 from textual.app import ComposeResult
 from textual.containers import Vertical
-from textual.widgets import Static
+from textual.geometry import Size
+from textual.strip import Strip
+from textual.widget import Widget
+from textual.widgets import Button, Static
 
 from ..core.qr import Matrix, QrError, QrPresentation
 
@@ -183,6 +189,23 @@ def protocol_qr_canvas_size(
     return pixel_width, cell_rows * cell_height
 
 
+def _protocol_qr_image(image, canvas: tuple[int, int]):
+    """Fit the original pixels to a cell canvas without stretching or blending."""
+    from PIL import Image
+
+    if image.size == canvas:
+        return image
+    width, height = canvas
+    scale = min(width / image.width, height / image.height)
+    fitted = image.resize(
+        (max(1, round(image.width * scale)), max(1, round(image.height * scale))),
+        Image.Resampling.NEAREST,
+    )
+    output = Image.new("RGB", canvas, "white")
+    output.paste(fitted, ((width - fitted.width) // 2, (height - fitted.height) // 2))
+    return output
+
+
 def prime_protocol_image() -> None:
     """Load the native image widget and prime iTerm2 sizing before Textual."""
 
@@ -267,9 +290,13 @@ def halfcell_image_class():
     return _load_halfcell_image()
 
 
-_BLACK_ON_WHITE = Style(color="#000000", bgcolor="#ffffff")
-_WHITE = Style(bgcolor="#ffffff")
-_BLACK = Style(bgcolor="#000000")
+# Draw solid modules with the cell background. A font's full-block glyph can
+# leave hairline gaps at the cell edges. The dedicated widget below preserves
+# these backgrounds through Textual's rendering instead of styling Rich Text.
+_INK = Style(color="#000000", bgcolor="#000000")
+_PAPER = Style(bgcolor="#ffffff")
+_INK_ON_PAPER = Style(color="#000000", bgcolor="#ffffff")
+_PAPER_ON_INK = Style(color="#ffffff", bgcolor="#000000")
 
 
 def half_block_qr(matrix: Matrix) -> Text:
@@ -282,13 +309,13 @@ def half_block_qr(matrix: Matrix) -> Text:
         bottom = matrix[top_index + 1] if top_index + 1 < len(matrix) else (False,) * width
         for upper, lower in zip(top, bottom, strict=True):
             if upper and lower:
-                result.append(" ", style=_BLACK)
+                result.append(" ", style=_INK)
             elif upper:
-                result.append("▀", style=_BLACK_ON_WHITE)
+                result.append("▀", style=_INK_ON_PAPER)
             elif lower:
-                result.append("▄", style=_BLACK_ON_WHITE)
+                result.append("▀", style=_PAPER_ON_INK)
             else:
-                result.append(" ", style=_WHITE)
+                result.append(" ", style=_PAPER)
         if top_index + 2 < len(matrix):
             result.append("\n")
     return result
@@ -315,19 +342,51 @@ def braille_qr(matrix: Matrix) -> Text:
                 for x in range(2):
                     if top + y < height and left + x < width and matrix[top + y][left + x]:
                         bits |= _BRAILLE_BITS[y][x]
-            result.append(chr(0x2800 + bits) if bits else " ", style=_BLACK_ON_WHITE)
+            result.append(chr(0x2800 + bits) if bits else " ", style=_INK_ON_PAPER)
         if top + 4 < height:
             result.append("\n")
     return result
 
 
 def unicode_qr(matrix: Matrix) -> Text:
-    """Use solid half blocks while they fit, compact Braille for long codes."""
+    """Render a phone-scannable QR with one terminal column per module.
 
-    # A 78-column manual card has 70 content columns after padding.  Long TV
-    # login URLs routinely produce 90+ modules, so those use the exact 2x4 bit
-    # representation instead of being clipped or resampled.
-    return braille_qr(matrix) if len(matrix) > 68 else half_block_qr(matrix)
+    Braille is compact but combines multiple modules into one character, which
+    is useful for display but unreliable for camera scanning.
+    """
+
+    return half_block_qr(matrix)
+
+
+class _QrModuleImage(Widget):
+    """Paint QR cells directly, preserving per-cell backgrounds and exact size."""
+
+    def __init__(self, matrix: Matrix) -> None:
+        super().__init__(classes="qr-unicode-image")
+        self._matrix = matrix
+        self._width = len(matrix[0])
+        self._height = (len(matrix) + 1) // 2
+        self.styles.width = self._width
+        self.styles.height = self._height
+
+    def get_content_width(self, container: Size, viewport: Size) -> int:
+        return self._width
+
+    def get_content_height(self, container: Size, viewport: Size, width: int) -> int:
+        return self._height
+
+    def render_line(self, y: int) -> Strip:
+        if not 0 <= y < self._height:
+            return Strip.blank(self._width, _PAPER)
+        top = self._matrix[y * 2]
+        bottom = self._matrix[y * 2 + 1] if y * 2 + 1 < len(self._matrix) else (False,) * self._width
+        segments = []
+        for upper, lower in zip(top, bottom, strict=True):
+            if upper == lower:
+                segments.append(Segment(" ", _INK if upper else _PAPER))
+            else:
+                segments.append(Segment("▀", _INK_ON_PAPER if upper else _PAPER_ON_INK))
+        return Strip(segments, cell_length=self._width)
 
 
 class QrWidget(Vertical):
@@ -336,34 +395,68 @@ class QrWidget(Vertical):
     def __init__(self, presentation: QrPresentation) -> None:
         super().__init__(classes="qr-frame")
         self.presentation = presentation
+        self._image = None
+        self._preview_dir = None
 
     def compose(self) -> ComposeResult:
+        from ..core.i18n import tr
+
         try:
             protocol_image = protocol_image_class()
+            self._image = self.presentation.image(
+                generated_canvas=protocol_qr_canvas_size() if protocol_image is not None else None,
+            )
             if protocol_image is not None:
                 yield protocol_image(
-                    self.presentation.image(
-                        generated_canvas=protocol_qr_canvas_size(),
-                    ),
+                    _protocol_qr_image(self._image, protocol_qr_canvas_size()),
                     classes="qr-protocol-image",
                 )
             else:
-                yield Static(
-                    unicode_qr(self.presentation.matrix()),
-                    classes="qr-unicode-image",
-                    markup=False,
-                )
+                yield _QrModuleImage(self.presentation.matrix(image=self._image))
+                warning = Static(tr("qr.too_wide"), classes="qr-render-error qr-size-error", markup=False)
+                warning.display = False
+                yield warning
         except (QrError, OSError, ValueError):
             # The link/action rows remain usable.  Do not include the exception:
             # it may contain a prefix of the data URI a service returned.
-            from ..core.i18n import tr
-
             message = tr("qr.no_image_link") if self.presentation.open_url else tr("qr.no_image")
             yield Static(
                 message,
                 classes="qr-render-error",
                 markup=False,
             )
+        if self._image is not None:
+            yield Button(tr("qr.open_image"), classes="qr-open-image")
+
+    def on_mount(self) -> None:
+        modules = self.query(".qr-unicode-image")
+        if modules and self.parent is not None and self.parent.has_class("qr-card"):
+            # Let a wide terminal show the whole grid, while the card's CSS
+            # max-width still limits it in small terminals.
+            self.parent.styles.width = max(
+                78, modules.first()._width + self.parent.styles.gutter.width,
+            )
+        self.on_resize()
+
+    def on_resize(self) -> None:
+        modules = self.query(".qr-unicode-image")
+        warning = self.query(".qr-size-error")
+        if not modules or not warning:
+            return
+        child = modules.first()
+        fits = self.content_size.width >= child._width
+        child.display = fits
+        warning.first().display = not fits
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if not event.button.has_class("qr-open-image") or self._image is None:
+            return
+        event.stop()
+        if self._preview_dir is None:
+            self._preview_dir = tempfile.TemporaryDirectory(prefix="unidl-qr-")
+        path = Path(self._preview_dir.name) / "qr.png"
+        self._image.save(path, format="PNG")
+        self.app.open_path(path)
 
     def on_unmount(self) -> None:
         """Release a Kitty terminal-side image as soon as the wait ends."""
@@ -375,6 +468,10 @@ class QrWidget(Vertical):
         if callable(cleanup):
             cleanup()
             child._renderable = None
+        if self._preview_dir is not None:
+            self._preview_dir.cleanup()
+            self._preview_dir = None
+        self._image = None
 
 
 __all__ = [

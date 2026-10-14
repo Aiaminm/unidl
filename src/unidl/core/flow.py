@@ -24,7 +24,7 @@ from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 from .partner import PartnerAuthorization, PartnerAuthorizationError
-from .qr import QrPresentation
+from .qr import QrPresentation, add_activation_code
 
 
 class Back(Exception):
@@ -534,7 +534,7 @@ class FlowContext:
             timeout=timeout,
             interval=interval,
             hint=hint,
-            qr=qr,
+            qr=add_activation_code(qr, lines),
             scope=scope,
         )
 

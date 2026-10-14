@@ -544,7 +544,7 @@ def _vault_target_settings(config: Any = None) -> list[Setting]:
 
 
 def service_license_settings(config: Any = None) -> list[Setting]:
-    """Per-service licensing and vault policy settings."""
+    """Per-service metadata, probing, licensing and vault policy settings."""
     targets = _vault_target_settings(config)
     by_key = {spec.key: spec for spec in targets}
     read_targets = field_replace(
@@ -574,6 +574,19 @@ def service_license_settings(config: Any = None) -> list[Setting]:
             help=(
                 "When enabled, this service may request optional posters, thumbnails "
                 "and artwork and download them as separate files."
+            ),
+        ),
+        Setting(
+            "fetch_actual_bitrate",
+            "Fetch actual video bitrate",
+            "bool",
+            default=True,
+            inherit_global=True,
+            help=(
+                "After final video selection, sample media response sizes to show "
+                "an actual bitrate and correct available colour metadata. Off skips "
+                "the probe and keeps manifest metadata. Follows the global default "
+                "until this service saves an override."
             ),
         ),
         Setting("license_after_tracks", "License after final track selection", "bool", default=False,
@@ -624,9 +637,9 @@ GLOBAL_SETTINGS: list[Setting] = [
         default="",
         picker="services_manager",
         help=(
-            "Manage which service packages are registered and which registered "
-            "services appear on the home screen. New registrations take effect "
-            "after restarting UniDL."
+            "Manage service registration, homepage visibility, chapter metadata, "
+            "title attachments, actual video bitrate and export manifest type. "
+            "New registrations take effect after restarting UniDL."
         ),
     ),
     Setting(

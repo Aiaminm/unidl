@@ -14,7 +14,7 @@ from pathlib import Path
 
 from .console import Palette, color_enabled, paint
 from .downloader import KNOWN_OUTPUT_SUFFIXES, HlsCrypto, _fetch_bytes, _HostAdaptiveLimiter, _should_prefer_curl
-from .embedding import DownloadCancelled, current_download_runtime
+from .embedding import DownloadCancelled, LiveRecordingStopped, current_download_runtime
 from .ism_live import stream_ism_timescale, stream_uses_ism_timeline_index
 from .live_rules import (
     live_media_retry_attempts,
@@ -55,6 +55,7 @@ class LiveRecordOptions:
     hls_crypto: HlsCrypto | None = None
     stop_on_interrupt: bool = False
     assemble_output: bool | Callable[[StreamInfo], bool] = True
+    stop_recording_requested: Callable[[], bool] | None = None
 
 
 @dataclass(slots=True)
@@ -109,12 +110,19 @@ def _raise_if_cancelled(options: LiveRecordOptions) -> None:
         raise DownloadCancelled("live recording cancelled")
 
 
+def _recording_stop_requested(options: LiveRecordOptions) -> bool:
+    callback = options.stop_recording_requested
+    return callback is not None and callback()
+
+
 def _wait_if_paused(options: LiveRecordOptions) -> None:
     paused = options.pause_requested
     if paused is None:
         return
     while paused():
         _raise_if_cancelled(options)
+        if _recording_stop_requested(options):
+            return
         _runtime_sleep(0.1)
 
 
@@ -129,6 +137,8 @@ def _wait_for_refresh(options: LiveRecordOptions, seconds: float) -> None:
     deadline = time.monotonic() + max(0.0, float(seconds or 0))
     while True:
         _checkpoint(options)
+        if _recording_stop_requested(options):
+            return
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             return
@@ -226,6 +236,8 @@ def record_live_stream_group(
     try:
         while True:
             _checkpoint(options)
+            if _recording_stop_requested(options):
+                break
             planned = _plan_group_batches(states, options)
             if planned:
                 stagnant_refreshes = 0
@@ -285,6 +297,8 @@ def record_live_stream_group(
                 if options.group_segment_sink:
                     options.group_segment_sink(group_batches)
 
+            if _recording_stop_requested(options):
+                break
             if record_limit is not None and all(state.recorded_seconds >= record_limit for state in states):
                 break
             if all(not state.current_stream.is_live and not _has_unseen(state.current_stream, state.seen) for state in states):
@@ -294,6 +308,9 @@ def record_live_stream_group(
             for state in states:
                 _emit_state_progress(options, state, 0, wait_status)
             _wait_for_refresh(options, wait_seconds)
+            _raise_if_cancelled(options)
+            if _recording_stop_requested(options):
+                break
             refresh_failed = not _refresh_group_states(states, options, headers=headers)
             if refresh_failed:
                 stagnant_refreshes += 1
@@ -302,6 +319,8 @@ def record_live_stream_group(
             elif any(state.segments_count for state in states):
                 stagnant_refreshes += 1
             wait_seconds = options.wait_seconds or _default_group_wait_seconds(states)
+    except LiveRecordingStopped:
+        pass  # Back while a new key is pending: finish the already captured batches.
     except DownloadCancelled:
         interrupted = True
         raise
@@ -385,6 +404,8 @@ def record_live_stream(
     try:
         while True:
             _checkpoint(options)
+            if _recording_stop_requested(options):
+                break
             media_segments = [segment for segment in current_stream.segments if segment.index != -1]
             init_segments = [segment for segment in current_stream.segments if segment.index == -1]
             new_segments = _new_live_media_segments(media_segments, seen, edge_index, recorded_count, options, stream=current_stream)
@@ -467,12 +488,17 @@ def record_live_stream(
                 else:
                     print(f"{paint('+', Palette.green, colors)} {len(new_segments)} segments | {_format_seconds(recorded_seconds)} | {output_path.name}")
 
+            if _recording_stop_requested(options):
+                break
             if record_limit is not None and recorded_seconds >= record_limit:
                 break
 
             wait_status = "AdBreak" if refresh_failed else "Waiting"
             _emit_live_progress(options, stream, recorded_seconds, recorded_count, 0, output_path, wait_status, available_seconds, available_count, downloaded_bytes=recorded_bytes)
             _wait_for_refresh(options, wait_seconds)
+            _raise_if_cancelled(options)
+            if _recording_stop_requested(options):
+                break
             if _is_sabr_ump_stream(current_stream):
                 first_sequence = edge_index + 1 if edge_index is not None else None
                 refresh_failed = not _refresh_sabr_live_stream_segments(
@@ -501,6 +527,8 @@ def record_live_stream(
             wait_seconds = options.wait_seconds or _default_wait_seconds(current_stream)
             if not current_stream.is_live and not _has_unseen(current_stream, seen):
                 break
+    except LiveRecordingStopped:
+        pass  # The new undecodable batch is excluded; existing media still finishes.
     except DownloadCancelled:
         interrupted = True
         raise

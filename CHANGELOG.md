@@ -1,5 +1,27 @@
 # Changelog
 
+## [2.3.9] - 2026-10-14
+
+### QR sign-in
+
+- Improved QR image clarity, preserved provider-supplied codes and added an image-opening fallback for compact terminals.
+
+### Live recording
+
+- Made Back finish and save live recordings normally, while Quit and failed finalization preserved already captured media without starting extra processing.
+
+### PlayReady licensing
+
+- Restricted License after final track selection to selected encrypted DASH tracks for both local and remote PlayReady CDMs, without changing full-manifest mode.
+
+### Video bitrate
+
+- Added independent per-service actual video bitrate controls with global inheritance and selected-track probing.
+
+### Batch cancellation
+
+- Fixed paused batch cancellation stalls by releasing pause state and moving socket and process cleanup off the interface thread.
+
 ## [2.3.8] - 2026-10-13
 
 ### Download reliability

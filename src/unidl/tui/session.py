@@ -31,6 +31,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlsplit
 
+from unidl.downloader.embedding import LiveRecordingStopped
 from unidl.downloader.utils import format_bitrate, pretty_codec
 
 from ..core import chapters as chapter_model
@@ -723,6 +724,10 @@ class SessionController:
         #: Set while transfer workers wait in place. Distinct from cancel: the
         #: delivery screen stays up and Resume continues the same native job.
         self.pause_event = threading.Event()
+        #: Back ends live capture normally; Quit remains a hard cancellation.
+        self.stop_recording_event = threading.Event()
+        self._recording_active = False
+        self._recording_back_requested = False
         #: true while the *remaining* queue is being abandoned, which does
         #: outlive one job but not the batch
         self.batch_cancelled = False
@@ -833,6 +838,7 @@ class SessionController:
         self.leaving = True
         self.batch_cancelled = True
         self.cancel_event.set()
+        self.pause_event.clear()
         # The event is the cooperative path; the engine owns the hard-stop path
         # for sockets and external downloader processes.  Keep this call
         # idempotent because both Back and application shutdown may reach it.
@@ -1216,6 +1222,10 @@ class SessionController:
         return self.pause_event.is_set()
 
     @property
+    def recording_stop_requested(self) -> bool:
+        return self.stop_recording_event.is_set()
+
+    @property
     def title_delay_active(self) -> bool:
         return self._title_delay_active
 
@@ -1225,6 +1235,7 @@ class SessionController:
             not (self.job_running or self._title_delay_active)
             or self.cancel_event.is_set()
             or self.pause_event.is_set()
+            or self.recording_stop_requested
         ):
             return False
         self.pause_event.set()
@@ -1248,6 +1259,24 @@ class SessionController:
 
     def clear_pause(self) -> None:
         self.pause_event.clear()
+
+    def request_recording_back(self) -> bool:
+        """Finish the current live capture before returning to its parent."""
+        if not self.job_running or not self._recording_active:
+            return False
+        if self.cancel_requested:
+            return True  # Quit/hard cancellation already owns the teardown.
+        if not self._recording_back_requested:
+            self._recording_back_requested = True
+            self.stop_recording_event.set()
+            self.pause_event.clear()
+            self.batch_cancelled = True
+            self.batch_total = None
+            self.post_log(tr("delivery.notify.finishing_recording"), "info")
+            self.post_status(tr("delivery.status.finishing_recording"))
+            if self.delivery is not None:
+                self._on_ui(self.delivery.refresh_keys)
+        return True  # Repeated Back never escalates to a hard cancellation.
 
     def request_cancel(self) -> bool:
         """Ask the running download to stop. Returns False if already asked.
@@ -1297,6 +1326,8 @@ class SessionController:
         """Forget a cancellation, so the next thing you start is not born dead."""
         self.cancel_event = threading.Event()
         self.pause_event = threading.Event()
+        self.stop_recording_event = threading.Event()
+        self._recording_back_requested = False
         self.batch_cancelled = False
 
     def _release_playback(self, playback: Playback) -> None:
@@ -1618,7 +1649,11 @@ class SessionController:
             while not event.wait(_ANSWER_POLL):
                 if self.aborted or self.cancel_requested:
                     raise KeyboardInterrupt("live key entry cancelled")
+                if self.recording_stop_requested:
+                    raise LiveRecordingStopped()
             value = box.get("value")
+            if self.recording_stop_requested and not (box.get("quit") or self.aborted or self.cancel_requested):
+                raise LiveRecordingStopped()
             if box.get("quit") or value is BACK or self.aborted:
                 self.request_cancel()
                 raise KeyboardInterrupt("live key entry cancelled")
@@ -2109,6 +2144,7 @@ class SessionController:
         finally:
             self._release_playback(playback)
             self.job_running = False
+            self._recording_active = False
             # Whatever happened, nothing is happening now. The status line says
             # what a job is *doing*, and it used to be cleared at each of the
             # places a job can end well - which left every other exit stating a
@@ -2181,6 +2217,16 @@ class SessionController:
 
     def _after_job(self) -> None:
         """Only call the screen finished when the whole queue is."""
+        if self._recording_back_requested and not self.job_running:
+            self._recording_back_requested = False
+            if not self.aborted and not self.cancel_requested:
+                if self.jobs and self.jobs[-1].state == DONE:
+                    if self.import_session:
+                        self.return_to_import()
+                    elif self.delivery is not None:
+                        self.app.run_worker(self._close(self.delivery), exit_on_error=False)
+                    return
+                # A failed final mux must remain visible for inspection/retry.
         if not self.queue_complete:
             return
         if self.delivery is not None:
@@ -2726,12 +2772,17 @@ class SessionController:
             return DONE, "exported"
 
         # Downloading, so now the native delivery screen: it is where structured
-        # progress is painted and where the queue lives.  Back remains navigation;
-        # an active transfer is cancelled as the screen returns to its parent.
+        # progress is painted and where the queue lives. Live Back waits for a
+        # normal finish; VOD Back retains its existing cancellation behaviour.
+        self._recording_active = (
+            playback.is_live
+            and (playback.live_window is None or playback.live_window.mode != "vod")
+            and "--live-perform-as-vod" not in playback.extra_args
+        )
         self.app.call_from_thread(self._open_delivery, playback, tracks)
         measure_bitrates = getattr(getattr(self, "engine", None), "measure_video_bitrates", None)
         if callable(measure_bitrates) and bool(self.settings.get("fetch_actual_bitrate", True)):
-            self.post_status("measuring selected video bitrate")
+            self.post_status(tr("delivery.status.measuring_bitrate"))
             ranges_before_probe = {
                 id(stream): str(stream.video_range or "")
                 for stream in tracks.selected
@@ -2757,6 +2808,7 @@ class SessionController:
                 cancel=self.cancel_event,
                 pause=self.pause_event,
                 service=self.service,
+                stop_recording=self.stop_recording_event,
             )
         finally:
             was_live = playback.is_live

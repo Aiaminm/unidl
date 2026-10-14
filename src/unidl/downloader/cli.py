@@ -61,6 +61,7 @@ from .embedding import (
     DownloadProgress,
     LiveKeyProvider,
     LiveKeyRequest,
+    LiveRecordingStopped,
     current_download_runtime,
     managed_popen,
     managed_run,
@@ -795,8 +796,10 @@ def _download(args: argparse.Namespace) -> int:
     try:
         result = _download_impl(args)
     except BaseException:
+        _settle_live_recording(args, success=False)
         _settle_task_workspace(args, success=False)
         raise
+    _settle_live_recording(args, success=result == 0)
     _settle_task_workspace(args, success=result == 0)
     return result
 
@@ -976,11 +979,16 @@ def _download_impl(args: argparse.Namespace) -> int:
             streams=live_streams,
             mux_format=getattr(args, "mux_format", None),
         )
-        pipe_stage = _stage_artifact_path(task_workspace, pipe_destination)
-        args._unidown_commit_targets[pipe_stage] = pipe_destination
-        pipe_session = _start_live_pipe_mux_session(live_streams, pipe_stage, args.save_name, default_save_base, args, keys, colors, hls_crypto=hls_crypto, temp_dir=_task_temp_subdir(args, "pipe"))
+        # A growing live output is user data, not an uncommitted VOD artifact.
+        # Pipe mux writes directly to the visible downloads directory. Track
+        # recordings live in a separate visible directory until final commit.
+        live_tracks_dir = _live_recording_tracks_dir(output_dir, pipe_destination.stem)
+        args._unidown_live_tracks_dir = live_tracks_dir
+        args._unidown_live_pipe_path = None  # Set only when the pipe actually owns an output.
+        pipe_session = _start_live_pipe_mux_session(live_streams, pipe_destination, args.save_name, default_save_base, args, keys, colors, hls_crypto=hls_crypto, temp_dir=_task_temp_subdir(args, "pipe"))
+        args._unidown_live_pipe_session = pipe_session
         try:
-            downloaded_tracks = _record_live_streams(live_streams, streams, args, headers, keys, pipe_stage, staged_output_dir, pipe_session=pipe_session, hls_crypto=hls_crypto)
+            downloaded_tracks = _record_live_streams(live_streams, streams, args, headers, keys, pipe_destination, live_tracks_dir, pipe_session=pipe_session, hls_crypto=hls_crypto)
         except BaseException:
             if pipe_session:
                 pipe_session.close(cancelled=True)
@@ -1067,10 +1075,10 @@ def _download_impl(args: argparse.Namespace) -> int:
                 protected_paths = [muxed, *[track.path for track in downloaded_tracks if _is_subtitle_stream(track.stream)]]
             if _has_subtitle_tracks(downloaded_tracks) and len(live_mux_tracks) != len(downloaded_tracks):
                 print(paint("Live subtitles kept as sidecar files.", Palette.yellow, colors))
-        _cleanup_intermediate_files(intermediate_paths, protected=protected_paths, args=args, colors=colors)
-        if not getattr(args, "live_keep_segments", True):
-            _cleanup_temp_dirs(temp_dirs, args, colors)
-        _print_cleanup_summary(args, colors)
+        if pipe_session and getattr(args, "live_keep_track_files", False):
+            protected_paths.extend(downloaded_paths)
+        # Commit before deleting source tracks. A failed move/remux must leave
+        # the existing recording recoverable regardless of debugging settings.
         protected_paths, metadata_paths = _commit_task_outputs(
             args,
             output_dir,
@@ -1078,6 +1086,10 @@ def _download_impl(args: argparse.Namespace) -> int:
             downloaded_tracks,
             metadata_paths,
         )
+        _cleanup_intermediate_files(intermediate_paths, protected=protected_paths, args=args, colors=colors)
+        if not getattr(args, "live_keep_segments", True):
+            _cleanup_temp_dirs(temp_dirs, args, colors)
+        _print_cleanup_summary(args, colors)
         _emit_download_artifacts(
             args,
             protected_paths,
@@ -1639,6 +1651,11 @@ def _embedding_cancel_callback(args) -> Callable[[], bool] | None:
 def _embedding_pause_callback(args) -> Callable[[], bool] | None:
     hooks = getattr(args, "embedding_hooks", None)
     return getattr(hooks, "pause_requested", None)
+
+
+def _embedding_recording_stop_callback(args) -> Callable[[], bool] | None:
+    hooks = getattr(args, "embedding_hooks", None)
+    return getattr(hooks, "stop_recording_requested", None)
 
 
 def _runtime_sleep(seconds: float) -> None:
@@ -3216,15 +3233,16 @@ class _WindowsNamedPipe:
     def flush(self) -> None:
         return None
 
-    def close(self) -> None:
+    def close(self, *, discard: bool = False) -> None:
         if self._closed:
             return
         self._closed = True
         if self._connected:
-            try:
-                self._kernel32.FlushFileBuffers(self._handle)
-            except OSError:
-                pass
+            if not discard:
+                try:
+                    self._kernel32.FlushFileBuffers(self._handle)
+                except OSError:
+                    pass
             self._kernel32.DisconnectNamedPipe(self._handle)
         self._kernel32.CloseHandle(self._handle)
 
@@ -3304,13 +3322,20 @@ class _LivePipeMuxSession:
         self.finalize_error: str | None = None
         self.finalize_succeeded = False
         self.closed = False
+        self.cancelled = False
+        self.graceful_stopped_streams: set[int] = set()
         try:
             os.unlink(windows_long_path(self.output_path))
         except FileNotFoundError:
             pass
-        self._create_pipes()
-        self._start_ffmpeg()
-        self._start_writer_threads()
+        self.args._unidown_live_pipe_path = self.output_path
+        try:
+            self._create_pipes()
+            self._start_ffmpeg()
+            self._start_writer_threads()
+        except BaseException:
+            self.close(cancelled=True)
+            raise
 
     def has_stream(self, stream) -> bool:
         return id(stream) in self.stream_ids
@@ -3325,6 +3350,8 @@ class _LivePipeMuxSession:
             self._enqueue_batch(batch)
 
     def _enqueue_batch(self, batch: LiveSegmentBatch) -> None:
+        if id(batch.stream) in getattr(self, "graceful_stopped_streams", set()):
+            return
         if _is_subtitle_stream(batch.stream):
             return
         if not self.has_stream(batch.stream):
@@ -3347,27 +3374,49 @@ class _LivePipeMuxSession:
         if self.closed:
             return
         self.closed = True
-        self._wait_for_writer_queues(timeout=5 if cancelled else 20)
+        self.cancelled = cancelled
+        if cancelled:
+            # Quit does not drain/decrypt queued batches or start a remux pass.
+            # Stop the existing child first so blocked FIFO writers are freed.
+            self._collect_ffmpeg_stderr(terminate=True, timeout=1)
+            for writer_queue in self.writer_queues.values():
+                while True:
+                    try:
+                        writer_queue.get_nowait()
+                        writer_queue.task_done()
+                    except queue.Empty:
+                        break
+        else:
+            self._wait_for_writer_queues(timeout=20)
         for writer_queue in self.writer_queues.values():
-            self._stop_writer_queue(writer_queue, timeout=1 if cancelled else 5)
+            self._stop_writer_queue(writer_queue, timeout=0.1 if cancelled else 5)
+        join_deadline = time.monotonic() + (1 if cancelled else 20)
         for thread in self.writer_threads:
-            thread.join(timeout=5)
+            thread.join(timeout=max(0, min(5, join_deadline - time.monotonic())))
         for writer in list(self.writers.values()):
             try:
-                writer.close()
+                if isinstance(writer, _WindowsNamedPipe):
+                    writer.close(discard=cancelled)
+                else:
+                    writer.close()
             except OSError:
                 pass
         self.writers.clear()
         self.webm_live_writers.clear()
         for server in self._windows_pipe_servers.values():
-            server.close()
+            server.close(discard=cancelled)
         self._windows_pipe_servers.clear()
         for thread in self.writer_threads:
             if thread.is_alive():
-                thread.join(timeout=5)
-        stderr = self._collect_ffmpeg_stderr(terminate=self.writer_error is not None, timeout=8 if cancelled else 20)
-        self._finalize_live_pipe_output(cancelled=cancelled)
-        if getattr(self.args, "del_after_done", True) and not getattr(self.args, "keep_temp", False):
+                thread.join(timeout=max(0, min(5, join_deadline - time.monotonic())))
+        stderr = self._collect_ffmpeg_stderr(terminate=self.writer_error is not None, timeout=1 if cancelled else 20)
+        if not cancelled:
+            self._finalize_live_pipe_output()
+        if (
+            not any(thread.is_alive() for thread in self.writer_threads)
+            and getattr(self.args, "del_after_done", True)
+            and not getattr(self.args, "keep_temp", False)
+        ):
             shutil.rmtree(windows_long_path(self.pipe_dir), ignore_errors=True)
         if not cancelled and self.writer_error is not None and not self._writer_error_is_clean_eof():
             message = self._ffmpeg_exit_message("live pipe mux stopped while writing media")
@@ -3377,6 +3426,8 @@ class _LivePipeMuxSession:
             raise RuntimeError(f"live pipe mux failed with status {self.process.returncode}{detail}")
 
     def _finalize_live_pipe_output(self, cancelled: bool = False) -> None:
+        if cancelled:
+            return
         if not should_finalize_live_pipe_matroska_output(getattr(self, "streams", []), getattr(self, "output_container", None)):
             return
         self.finalize_succeeded = False
@@ -3428,6 +3479,9 @@ class _LivePipeMuxSession:
         # against the filesystem while the finalization stages run.
         source_path = bounded_path(self.output_path.with_name(f"{temp_base}.source{suffix}"), max_length=WINDOWS_INTERMEDIATE_PATH_LIMIT)
         source_moved = False
+        mp4_ready = False
+        mkv_ready = False
+        recovery_path = None
         try:
             self.output_path.replace(source_path)
             source_moved = True
@@ -3458,6 +3512,7 @@ class _LivePipeMuxSession:
                 stage="MP4 timestamp rebuild",
             )
             self._ensure_live_pipe_finalize_output(temp_mp4_path, "ffmpeg produced an empty finalized MP4")
+            mp4_ready = True
             # The verified MP4 supersedes the raw live output. Release the raw
             # bytes before extracting HEVC or building the MKV.
             source_path.unlink(missing_ok=True)
@@ -3501,6 +3556,7 @@ class _LivePipeMuxSession:
                     stage="Matroska timestamp finalize",
                 )
             self._ensure_live_pipe_finalize_output(temp_mkv_path, "ffmpeg produced an empty finalized MKV")
+            mkv_ready = True
             # The completed MKV is the only input needed by the optional
             # compatibility pass. Remove the full-size MP4 and HEVC staging
             # files before creating another output-sized file.
@@ -3519,16 +3575,24 @@ class _LivePipeMuxSession:
             else:
                 temp_mkv_path.replace(self.output_path)
         except OSError as exc:
-            self._restore_live_finalize_output(source_path, temp_mkv_path, temp_mp4_path, source_moved)
+            recovery_path = self._restore_live_finalize_output(
+                source_path, temp_mkv_path, temp_mp4_path, source_moved,
+                mp4_ready=mp4_ready, mkv_ready=mkv_ready,
+            )
             raise RuntimeError(str(exc)) from exc
-        except Exception:
+        except BaseException:
             # If a later stage fails, restore the renamed raw recording or the
             # completed MKV/MP4. All restores are same-directory renames and do
             # not need additional free space.
-            self._restore_live_finalize_output(source_path, temp_mkv_path, temp_mp4_path, source_moved)
+            recovery_path = self._restore_live_finalize_output(
+                source_path, temp_mkv_path, temp_mp4_path, source_moved,
+                mp4_ready=mp4_ready, mkv_ready=mkv_ready,
+            )
             raise
         finally:
             for temp_path in (source_path, temp_mp4_path, temp_hevc_path, temp_mkv_path, temp_compatible_mp4_path):
+                if temp_path == recovery_path:
+                    continue  # A failed recovery rename must never destroy the sole recording.
                 try:
                     temp_path.unlink(missing_ok=True)
                 except OSError:
@@ -3542,27 +3606,35 @@ class _LivePipeMuxSession:
         temp_mkv_path: Path,
         temp_mp4_path: Path,
         source_moved: bool,
-    ) -> None:
+        *,
+        mp4_ready: bool = True,
+        mkv_ready: bool = True,
+    ) -> Path | None:
         """Leave a playable result when a later finalization stage fails."""
         if self.output_path.exists():
-            return
-        recovery_path = source_path if source_moved else temp_mkv_path
-        if recovery_path.exists():
+            return self.output_path
+        candidates = [
+            *([source_path] if source_moved else []),
+            *([temp_mkv_path] if mkv_ready else []),
+            *([temp_mp4_path] if mp4_ready else []),
+        ]
+        for recovery_path in candidates:
+            if not recovery_path.exists():
+                continue
+            fallback = (
+                unique_path(self.output_path.with_suffix(".mp4"))
+                if recovery_path == temp_mp4_path else self.output_path
+            )
             try:
-                recovery_path.replace(self.output_path)
-            except OSError:
-                pass
-            return
-        # The MP4 timestamp rebuild is already a valid playable fallback. Keep
-        # its truthful suffix rather than leaving MP4 bytes under an MKV name.
-        if temp_mp4_path.exists():
-            fallback = self.output_path.with_suffix(".mp4")
-            try:
-                temp_mp4_path.replace(fallback)
+                recovery_path.replace(fallback)
                 self.output_path = fallback
-                self.output_container = "mp4"
+                if recovery_path == temp_mp4_path:
+                    self.output_container = "mp4"
+                return fallback
             except OSError:
-                pass
+                self.output_path = recovery_path
+                return recovery_path
+        return None
 
     def _finalize_matroska_output_to_mp4(
         self,
@@ -3789,7 +3861,14 @@ class _LivePipeMuxSession:
         for stream in self.streams:
             writer_queue: queue.Queue[LiveSegmentBatch | None] = queue.Queue(maxsize=self.writer_queue_size)
             self.writer_queues[id(stream)] = writer_queue
-            thread = threading.Thread(target=self._writer_loop, args=(stream, writer_queue), daemon=True)
+            # Writer-side decrypt/remux children belong to this same runtime.
+            # Quit must prevent new subprocesses here as well as in the recorder.
+            context = contextvars.copy_context()
+            thread = threading.Thread(
+                target=context.run,
+                args=(self._writer_loop, stream, writer_queue),
+                daemon=True,
+            )
             thread.start()
             self.writer_threads.append(thread)
 
@@ -3800,15 +3879,41 @@ class _LivePipeMuxSession:
                 if batch is None:
                     writer = self.writers.pop(id(stream), None)
                     if writer is not None:
-                        writer.close()
+                        if isinstance(writer, _WindowsNamedPipe):
+                            writer.close(discard=getattr(self, "cancelled", False))
+                        else:
+                            writer.close()
+                    return
+                if getattr(self, "cancelled", False):
                     return
                 payload = self._payload_items(batch)
+                if getattr(self, "cancelled", False):
+                    return
                 if not payload:
                     continue
                 writer = self._writer_for(stream)
                 for _sequence, path, segment in payload:
                     self._wait_for_rotation_boundary(stream, segment)
                     self._write_payload_path(stream, writer, path, segment)
+            except LiveRecordingStopped:
+                # Back in the rotated-key prompt excludes this undecodable
+                # batch, closes this input normally and keeps prior media.
+                self.graceful_stopped_streams.add(id(stream))
+                while True:
+                    try:
+                        writer_queue.get_nowait()
+                        writer_queue.task_done()
+                    except queue.Empty:
+                        break
+                writer = self.writers.pop(id(stream), None)
+                if writer is not None:
+                    writer.close()
+                condition = getattr(self, "rotation_condition", None)
+                if condition is not None:
+                    with condition:
+                        self.rotation_released.update(self.rotation_markers)
+                        condition.notify_all()
+                return
             except BaseException as exc:
                 self._set_writer_error(exc)
                 return
@@ -3836,7 +3941,24 @@ class _LivePipeMuxSession:
             if os.name == "nt":
                 writer = self._windows_pipe_servers[key]
             else:
-                writer = self.pipe_paths[key].open("wb", buffering=0)
+                # A blocking FIFO open can outlive a reader killed by Quit.
+                # Wait cooperatively for FFmpeg to connect, then keep normal
+                # blocking writes so throughput/backpressure stay unchanged.
+                while True:
+                    if getattr(self, "cancelled", False):
+                        raise DownloadCancelled("live pipe closed")
+                    runtime = current_download_runtime()
+                    if runtime is not None:
+                        runtime.checkpoint()
+                    try:
+                        descriptor = os.open(self.pipe_paths[key], os.O_WRONLY | os.O_NONBLOCK)
+                        break
+                    except OSError as exc:
+                        if exc.errno != errno.ENXIO:
+                            raise
+                        _runtime_sleep(0.05)
+                os.set_blocking(descriptor, True)
+                writer = os.fdopen(descriptor, "wb", buffering=0)
             self.writers[key] = writer
         return writer
 
@@ -4566,6 +4688,7 @@ def _record_live_streams(live_streams, all_streams, args, headers, keys, output,
         progress=progress_callback,
         cancel_requested=_embedding_cancel_callback(args),
         pause_requested=_embedding_pause_callback(args),
+        stop_recording_requested=_embedding_recording_stop_callback(args),
         segment_sink=pipe_session.write_batch if pipe_session else None,
         group_segment_sink=pipe_session.write_group if pipe_session else None,
         segment_key_observer=(
@@ -7732,7 +7855,10 @@ def _commit_task_outputs(
         key = _path_key(path)
         if key in moved:
             return moved[key]
-        if not _path_is_under(path, workspace):
+        live_tracks = getattr(args, "_unidown_live_tracks_dir", None)
+        if not _path_is_under(path, workspace) and not (
+            live_tracks is not None and _path_is_under(path, Path(live_tracks))
+        ):
             moved[key] = path
             return path
         destination = preferred.get(key)
@@ -7760,6 +7886,60 @@ def _commit_task_outputs(
                     track.cleanup_paths,
                 )
     return committed_paths, committed_metadata
+
+
+def _live_recording_tracks_dir(output_dir: Path, name: str) -> Path:
+    """Create a visible, collision-free directory for an active recording."""
+    candidate = bounded_path(
+        output_dir / f"{_safe_output_name(name)}.recording",
+        max_length=WINDOWS_INTERMEDIATE_PATH_LIMIT - 80,
+    )
+    base = candidate
+    index = 0
+    while True:
+        try:
+            candidate.mkdir()
+            return candidate
+        except FileExistsError:
+            index += 1
+            candidate = base.with_name(f"{base.stem}.{index}.recording")
+
+
+def _settle_live_recording(args: argparse.Namespace, *, success: bool) -> None:
+    """Keep captured media on stop/failure; only remove empty live directories."""
+    directory = getattr(args, "_unidown_live_tracks_dir", None)
+    if directory is None:
+        return
+    directory = Path(directory)
+    session = getattr(args, "_unidown_live_pipe_session", None)
+    pipe_path = getattr(session, "output_path", None) or getattr(args, "_unidown_live_pipe_path", None)
+    captured = []
+    candidates = ([Path(pipe_path)] if pipe_path is not None else [])
+    candidates.extend(path for path in directory.glob("*") if not path.name.startswith("."))
+    for path in candidates:
+        try:
+            if path.is_file() and path.stat().st_size > 0:
+                captured.append(path)
+            elif pipe_path is not None and path == Path(pipe_path) and path.is_file():
+                path.unlink()  # No media was recorded; remove only the empty owned output.
+        except OSError:
+            continue
+    if not success and captured:
+        for path in captured:
+            message = f"Recording kept: {path}"
+            try:
+                print(message)
+                _log_line(args, message)
+            except Exception:
+                pass  # The host may already be gone; preserving media comes first.
+        try:
+            _emit_download_artifacts(args, captured, [])
+        except Exception:
+            pass  # An unavailable UI callback must not mask the original stop/error.
+    try:
+        directory.rmdir()  # Never recursively delete captured tracks or user files.
+    except OSError:
+        pass
 
 
 def _settle_task_workspace(args: argparse.Namespace, *, success: bool) -> None:

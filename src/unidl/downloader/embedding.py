@@ -24,6 +24,10 @@ if TYPE_CHECKING:
     from .models import SegmentInfo, StreamInfo
 
 
+class LiveRecordingStopped(Exception):
+    """End capture at the last usable batch, without cancelling finalization."""
+
+
 @dataclass(frozen=True, slots=True)
 class LiveKeyRequest:
     """Context for a key first observed during an active live recording."""
@@ -63,6 +67,8 @@ class DownloadRuntime:
     def __init__(self) -> None:
         self._stop = threading.Event()
         self._lock = threading.RLock()
+        self._cleanup_lock = threading.Lock()
+        self._shutdown_thread: threading.Thread | None = None
         self._processes: dict[int, tuple[subprocess.Popen, bool]] = {}
         self._closers: dict[int, Callable[[], None]] = {}
         self._next_closer = 0
@@ -147,6 +153,25 @@ class DownloadRuntime:
         with self._lock:
             self._closers.pop(token, None)
 
+    def request_shutdown(self, *, grace: float = 0.15) -> None:
+        """Signal cancellation immediately without closing resources on the UI.
+
+        Closing a transport may wait for a reader, whose progress/exit callback
+        needs that same UI thread. One owned cleanup thread breaks that cycle;
+        the delivery owner joins it in close() before releasing this runtime.
+        """
+        self._stop.set()
+        with self._lock:
+            if self._shutdown_thread is not None:
+                return
+            self._shutdown_thread = threading.Thread(
+                target=self._close_resources,
+                kwargs={"grace": grace},
+                name="unidl-download-cleanup",
+                daemon=True,
+            )
+            self._shutdown_thread.start()
+
     def shutdown(self, *, grace: float = 0.15) -> None:
         """Stop this delivery and all of its external resources.
 
@@ -155,24 +180,33 @@ class DownloadRuntime:
         complete process group so a descendant cannot remain behind.
         """
         self._stop.set()
-        self._close_resources(grace=grace)
+        self.close(grace=grace)
 
     def close(self, *, grace: float = 0.15) -> None:
         """Release a completed delivery without marking it cancelled."""
+        with self._lock:
+            cleanup = self._shutdown_thread
+        if cleanup is not None and cleanup is not threading.current_thread():
+            cleanup.join()
         self._close_resources(grace=grace)
 
     def _close_resources(self, *, grace: float) -> None:
+        with self._cleanup_lock:
+            self._close_resources_locked(grace=grace)
+
+    def _close_resources_locked(self, *, grace: float) -> None:
         with self._lock:
             closers = list(self._closers.values())
             self._closers.clear()
             processes = list(self._processes.values())
+        # Do not let a slow transport closer delay signalling child processes.
+        for process, process_group in processes:
+            self._signal_process(process, process_group, signal.SIGTERM)
         for closer in closers:
             try:
                 closer()
             except Exception:
                 pass
-        for process, process_group in processes:
-            self._signal_process(process, process_group, signal.SIGTERM)
         deadline = time.monotonic() + max(0.0, float(grace))
         while time.monotonic() < deadline:
             if all(process.poll() is not None for process, _group in processes):
@@ -319,6 +353,7 @@ class DownloadHooks:
     display_width: Callable[[], int | None] | None = None
     console_progress: bool = True
     console_output: bool = True
+    stop_recording_requested: Callable[[], bool] | None = None
 
 
 __all__ = [
@@ -330,6 +365,7 @@ __all__ = [
     "DownloadRuntime",
     "LiveKeyProvider",
     "LiveKeyRequest",
+    "LiveRecordingStopped",
     "current_download_runtime",
     "managed_popen",
     "managed_run",

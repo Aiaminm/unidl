@@ -1165,6 +1165,15 @@ class AskHost(Screen):
     # -------------------------------------------------------------- navigation
     def go_back(self) -> bool:
         """Answer the pending ask with Back; the flow decides what that means."""
+        controller = getattr(self, "controller", None)
+        if (
+            controller is not None
+            and self is getattr(controller, "delivery", None)
+            and controller.request_recording_back()
+        ):
+            if self.waiting:
+                self._resolve(BACK)
+            return True
         if self.waiting:
             root_back = getattr(self, "_ask_scope", None) == SCOPE_ROOT
             controller = getattr(self, "controller", None)

@@ -418,6 +418,8 @@ class DeliveryHooks:
     emit: Callable[[DeliveryEvent], None] = _discard_event
     request_live_key: Callable[[LiveKeyRequest], str | None] = _no_live_key
     display_width: Callable[[], int | None] = _no_width
+    # End live capture normally without cancelling its final mux/commit.
+    stop_recording_requested: Callable[[], bool] | None = None
 
 
 @runtime_checkable

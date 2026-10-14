@@ -40,6 +40,14 @@ explicit `CancellationToken` rather than by hijacking terminal output. The
 backend checks the token in transfer workers and live-refresh loops, cancels
 pending work, and closes temporary state.
 
+Cancellation also releases a paused transfer; it never requires **Resume**
+first. Back or Quit cancels the remaining batch even while paused. The stop
+signal is immediate, while socket/process cleanup runs outside the TUI thread
+so navigation and worker callbacks stay responsive. Native HTTP socket reads
+are interrupted before their buffered responses are closed. The download
+owner waits for cleanup before it returns, so this does not leave a detached
+downloader or resource-cleanup thread behind.
+
 The public result is `DeliveryStatus.CANCELLED` with exit code 130. It is not
 reported as a failed download because the user explicitly asked to stop.
 

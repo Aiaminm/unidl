@@ -12,6 +12,7 @@ Changes persist immediately and apply to the next request without a restart.
 
 Global Settings → **Services** contains the global **License after final track
 selection** default, **Chapter metadata by service**,
+**Title attachments by service**, **Actual video bitrate by service**,
 **Register a service**, **Services shown on home**, and **Export manifest type**.
 UniDL discovers service packages from the active package directory, the source
 checkout's `src/unidl/services`, the current project's `services` directory and
@@ -154,13 +155,14 @@ heartbeat interval is part of the shared settings contract.
 | Setting | Values | Default | Notes |
 |---------|--------|---------|-------|
 | `download_manager` | manager screen | — | Opens **Download behavior**, which owns `after_resolve`, live defaults, batch confirmation and native transfer options. Licence timing defaults are configured under **Services** and may be overridden per service. |
+| `services_manager` | manager screen | — | Opens **Services**, including registration, homepage visibility, chapters, attachments, actual video bitrate, licence defaults and export manifest type. Metadata and bitrate switches can be set independently for each service. |
 | `resource_manager` | manager screen | — | Opens **DRM & vaults**, the single place to choose the app-wide DRM/CDM, edit CDM rules, add/edit/delete remote CDMs and vaults, enable/disable backends, choose local vaults, and open vault policy. |
 | `storage_manager` | manager screen | — | Opens **Files & naming**, the single place to edit ordinary output folders and file-name templates, preview a sample release name, and inspect sensitive runtime paths without moving them. |
 | `proxy_manager` | manager screen | — | Opens **Proxy & VPN**, where the default route, segment-download routing, named endpoints and HTTPS proxy providers are managed together. |
 | `justwatch_manager` | manager screen | — | Opens **JustWatch search**, where the one title-catalogue country and the separate availability-country list are edited together. The two underlying values remain independent. |
 | `interface_manager` | manager screen | — | Opens **Interface & diagnostics**, which owns the `theme`, `interface_locale` and `debug` choices. |
 | `after_resolve` | `download` / `command` / `ask` | `download` | Compatibility key controlled by **Download behavior**. `command` reproduces the old scripts' behaviour of only emitting a command; the main screen shortcut `d` still cycles it. |
-| `fetch_actual_bitrate` | on / off | **on** | Compatibility key controlled by **Download behavior**. After the final video tracks are selected and the download details screen is visible, UniDL samples distributed media segments to show an actual bitrate beside the manifest estimate. During that same probe it may read the selected video's bounded MP4 initialization metadata to correct a missing HLG/HDR label before final naming. A probe is accepted only when the complete segment size is known; unreliable CDN responses are omitted. Off skips all of this and keeps manifest metadata only. |
+| `fetch_actual_bitrate` | on / off | **on** | Controlled by **Settings → Services → Actual video bitrate by service** or the individual service's settings. Unconfigured services inherit the global default; saved service overrides are independent. Press `r` on a service row to resume inheritance. Existing global preferences are preserved. After the final video tracks are selected and the download details screen is visible, UniDL samples distributed media segments to show an actual bitrate beside the manifest estimate. During that same probe it may read the selected video's bounded MP4 initialization metadata to correct a missing HLG/HDR label before final naming. A probe is accepted only when the complete segment size is known; unreliable CDN responses are omitted. Off skips all of this and keeps manifest metadata only. |
 | `drm_system` | registered DRM systems | first registered system | Compatibility key controlled by **DRM & vaults → DRM system**. A service that declares exactly one system pins that system; a multi-system service may expose its own override. |
 | `cdm_rules` | resolution-to-device rules | empty | Compatibility key controlled by **DRM & vaults → CDM rules**. Rules choose the app-wide CDM by output resolution and never replace a service's own CDM setting. |
 | `theme` | `dark` / `light` | `dark` | Compatibility key controlled by **Interface & diagnostics**. Also switch with `ctrl+t`; changes repaint the current screen immediately. |
@@ -191,15 +193,35 @@ heartbeat interval is part of the shared settings contract.
 | `resume_parts` | on / off | on | Compatibility key controlled by **Download behavior**. Reuse verified tmp parts after a pause or retry. |
 | `check_segments_count` | on / off | on | Compatibility key controlled by **Download behavior**. Fail a track whose downloaded part count does not match the manifest. |
 | `keep_temp` | on / off | off | Compatibility key controlled by **Download behavior**. Debug mode also keeps temp files. |
-| `keep_failed_intermediates` | on / off | off | Compatibility key controlled by **Download behavior**. Keeps the per-task staged video, audio, subtitle and failed mux files after a failed or cancelled delivery for debugging. It does not change segment-cache retention; use `keep_temp` for that. |
+| `keep_failed_intermediates` | on / off | off | Compatibility key controlled by **Download behavior**. Keeps failed VOD track/mux staging for debugging. It does not change segment-cache retention (`keep_temp`). Captured live recordings are preserved on Quit or failure regardless of this setting. |
 | `delete_temp_after_done` | on / off | on | Compatibility key controlled by **Download behavior**. Remove temp directories after a successful title. |
 | `auto_subtitle_fix` | on / off | on | Compatibility key controlled by **Download behavior**. Tidy converted subtitle cues. |
 | `live_real_time_merge` | on / off | on | Compatibility key controlled by **Download behavior**. Append live segments while recording. |
 | `live_keep_segments` | on / off | off | Compatibility key controlled by **Download behavior**. Keep per-segment live files. |
-| `live_pipe_mux` | on / off | on | Compatibility key controlled by **Download behavior**. Mux live audio/video after recording; ignored for audio-only titles. |
+| `live_pipe_mux` | on / off | on | Compatibility key controlled by **Download behavior**. Mux compatible live audio/video while recording into a visible, growing file in the download directory. When unavailable/disabled, tracks are muxed after recording stops normally. Audio conversion may disable pipe mux. |
 | `fetch_chapters` | on / off | on | Legacy global default for services without an explicit chapter policy. Edit each service under **Services → Chapter metadata by service**, or in its own settings. Acquisition and **Embed chapters in the final file** are independent. |
 | `justwatch_search_region` | one ISO country code | first built-in region | Compatibility key controlled by **JustWatch search → Title catalogue**. The JustWatch search screen can edit it directly. |
 | `justwatch_regions` | comma-separated ISO country codes | built-in region list | Availability lookup order. Each region is a separate request; edit it from Settings or the region picker. See [availability.md](availability.md). |
+
+### Ending a live recording
+
+- **Back** ends capture like reaching the duration limit. It completes the
+  current segment batch, closes the real-time mux or runs the post-recording
+  mux, saves the final file, then returns. A paused recording is unpaused for
+  this finish; repeated Back does not cancel finalization.
+  If a rotated-key prompt is open, Back finishes the already captured portion
+  and excludes the pending batch whose key is unavailable.
+- **Quit** uses fast cancellation. It does not start extra mux, decryption or
+  transcoding passes. Already-written recordings are kept, but an interrupted
+  container may be incomplete and raw tracks may still require processing.
+- A real-time mux file is visible directly in the download directory during
+  recording. Separate tracks live in `<name>.recording/`. Successful normal
+  completion removes superseded tracks only after the final file is committed,
+  respecting the existing retention settings. Quit, failed mux or failed
+  commit preserves captured media there; a failed finish stays on screen for
+  inspection/retry. Only empty owned recording directories/files are removed.
+- Ordinary VOD cancellation and live replay taken **as VOD** keep their existing
+  cancellation/resume behaviour.
 
 ### JustWatch search
 
@@ -455,6 +477,25 @@ malformed or temporarily unavailable response is reduced to no chapters (with a
 warning where the service can report one) and never prevents playback, licence
 acquisition, downloading or muxing.
 
+## Actual video bitrate
+
+Open **Settings → Services → Actual video bitrate by service** to change the
+global default (on for a new install) or toggle individual registered services.
+The same **Fetch actual video bitrate** switch is available in each service's
+settings. Both editors save the same service-scoped `fetch_actual_bitrate`
+value. A service without an override follows the global default; changing the
+global row does not overwrite service choices. Press `r` on a service row to
+remove its override, or on the global row to restore the on default. Existing
+global preferences survive this move from **Download behavior**.
+
+Measurement still runs only after final video selection, with the download
+details screen already visible. It samples selected video tracks, not the full
+manifest inventory, and may correct their colour-range labels and final naming
+using the same probe. It adds no probing to the initial manifest/track listing.
+Off skips this probe entirely and retains the manifest bitrate and colour
+metadata. Live recording is not probed, and unavailable or unreliable samples
+are omitted without failing the download.
+
 ## Title attachments
 
 **Fetch title attachments** is independently configurable for each service in
@@ -511,7 +552,7 @@ self.settings.get("debug")          # global, resolved through the parent scope
 
 One object, three scopes, resolved by fallback. Most service settings shadow a
 global key when a service declares the same name. Shared policy keys
-(`fetch_chapters`, `license_after_tracks`, vault gates, and vault target lists)
+(`fetch_chapters`, `fetch_actual_bitrate`, `license_after_tracks`, vault gates, and vault target lists)
 instead inherit the global value until a service explicitly saves an override.
 An explicit `false` or empty target list is still an override. Press `r` on an
 inherited service-policy row to remove that override and resume global fallback.

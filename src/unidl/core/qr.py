@@ -17,10 +17,11 @@ import io
 import re
 import urllib.error
 import urllib.request
+from collections.abc import Sequence
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import TYPE_CHECKING
-from urllib.parse import urlsplit
+from urllib.parse import parse_qsl, unquote, urlencode, urlsplit, urlunsplit
 
 if TYPE_CHECKING:
     from PIL import Image
@@ -35,7 +36,7 @@ MAX_REMOTE_IMAGE_REDIRECTS = 3
 """Maximum number of HTTPS redirects followed for an official QR image."""
 
 MAX_REMOTE_IMAGE_ATTEMPTS = 2
-"""Retry one interrupted CDN response before falling back to the payload."""
+"""Retry one interrupted CDN response before reporting a display error."""
 
 REMOTE_IMAGE_TIMEOUT = 4.0
 """Short timeout so a QR presenter never waits indefinitely on an image CDN."""
@@ -56,9 +57,8 @@ class QrPresentation:
 
     ``image_data`` and ``image_url`` are preferred when supplied: some providers
     return an official QR bitmap whose signing/quiet-zone/logo parameters are
-    part of their login contract.  ``payload`` is then the reliable fallback and
-    is also used when no provider image exists.  ``image_data`` is for services
-    such as Migu which return only a PNG/JPEG data URI.
+    part of their login contract. ``payload`` is used when no provider image
+    exists. An official image must never be replaced by the fallback homepage.
 
     ``fallback_url`` is the address a presenter may open if the terminal cannot
     show the code.  It is intentionally separate from the image data so a base64
@@ -101,30 +101,23 @@ class QrPresentation:
         remain authoritative and are returned unchanged.
         """
 
-        # An API-provided bitmap is authoritative.  It can contain provider-
-        # specific margins or an embedded logo that a freshly encoded payload
-        # loses.  A bad/stale CDN response must not make a valid payload unusable.
+        # A provider bitmap may encode a session URL different from the browser
+        # landing page in payload. Never replace it with a newly encoded URL.
         if self.image_data:
-            try:
-                return _open_image(_image_bytes(self.image_data))
-            except QrError:
-                if not str(self.payload or "").strip():
-                    raise
+            return _open_image(_image_bytes(self.image_data))
 
         remote_url = self._image_source_url()
         if remote_url:
-            try:
-                return _open_image(_download_image(remote_url))
-            except QrError:
-                if not str(self.payload or "").strip():
-                    raise
+            return _open_image(_download_image(remote_url))
 
         payload = str(self.payload or "").strip()
+        if payload.lower().startswith("data:image/"):
+            return _open_image(_image_bytes(payload))
         if payload:
             return _generated_image(payload, canvas=generated_canvas)
         raise QrError("QR presentation has no usable image or payload")
 
-    def matrix(self) -> Matrix:
+    def matrix(self, *, image: Image.Image | None = None) -> Matrix:
         """Return exact light/dark modules for the terminal-text fallback."""
 
         # Prefer the provider-rendered image whenever one exists.  This matters
@@ -132,13 +125,11 @@ class QrPresentation:
         # provider may have chosen a larger QR version, quiet zone, or logo-safe
         # margin than a local re-encoding of its scan URL.
         if self.image_data or self._image_source_url():
-            try:
-                return _matrix_from_image(self.image())
-            except QrError:
-                if not str(self.payload or "").strip():
-                    raise
+            return _matrix_from_image(image if image is not None else self.image())
 
         payload = str(self.payload or "").strip()
+        if payload.lower().startswith("data:image/"):
+            return _matrix_from_image(image if image is not None else self.image())
         if payload:
             import qrcode
 
@@ -165,7 +156,74 @@ class QrPresentation:
         if _is_https_url(explicit):
             return explicit
         legacy = str(self.fallback_url or "").strip()
-        return legacy if _is_remote_image_url(legacy) else ""
+        if _is_remote_image_url(legacy):
+            return legacy
+        payload = str(self.payload or "").strip()
+        return payload if _is_remote_image_url(payload) else ""
+
+
+def add_activation_code(
+    presentation: QrPresentation | None,
+    lines: Sequence[str | tuple[str, str]],
+) -> QrPresentation | None:
+    """Complete a generated activation URL with the code shown beside it.
+
+    Provider-rendered QR images are authoritative and are never changed. This
+    fixes services whose API returns a generic activation page and a TV code as
+    separate fields without changing individual service implementations.
+    """
+
+    if (
+        presentation is None
+        or presentation.image_data
+        or presentation._image_source_url()
+    ):
+        return presentation
+    payload = str(presentation.payload or "").strip()
+    if not payload.startswith(("http://", "https://")):
+        return presentation
+    code = _activation_code(lines)
+    if not code:
+        return presentation
+    parsed = urlsplit(payload)
+    if _is_remote_image_url(payload):
+        return presentation
+    query = parse_qsl(parsed.query, keep_blank_values=True)
+    code_keys = {"code", "user_code", "usercode", "device_code", "devicecode", "pin", "passcode"}
+    code_key_indexes = [index for index, (key, _value) in enumerate(query) if key.casefold() in code_keys]
+    if code_key_indexes:
+        if any(query[index][1] for index in code_key_indexes):
+            return presentation
+        key_index = code_key_indexes[0]
+        query[key_index] = (query[key_index][0], code)
+    elif code.casefold() in unquote(parsed.path).casefold() or any(
+        code.casefold() in value.casefold() for _key, value in query
+    ):
+        return presentation
+    else:
+        query.append(("code", code))
+    completed = urlunsplit((parsed.scheme, parsed.netloc, parsed.path, urlencode(query), parsed.fragment))
+    return QrPresentation(
+        payload=completed,
+        image_data=presentation.image_data,
+        fallback_url=presentation.fallback_url,
+        alt=presentation.alt,
+        image_url=presentation.image_url,
+    )
+
+
+def _activation_code(lines: Sequence[str | tuple[str, str]]) -> str:
+    labels = {
+        "code", "user code", "user_code", "device code", "device_code", "tv code",
+        "pairing code", "activation code", "login code", "auth code", "pin", "passcode",
+    }
+    for item in lines:
+        if not isinstance(item, tuple) or len(item) != 2:
+            continue
+        label, value = str(item[0]).strip().casefold().rstrip(": "), str(item[1]).strip()
+        if label in labels and value and not value.startswith(("http://", "https://")):
+            return value
+    return ""
 
 
 def _image_bytes(value: str | bytes) -> bytes:
@@ -187,16 +245,17 @@ def _image_bytes(value: str | bytes) -> bytes:
     return raw
 
 
-# Do not treat every ``/qr-login`` or ``/qr`` activation page as an image: that
-# would add a needless network timeout before the payload fallback.  These are
-# the provider endpoint names used by the ported TV clients; ordinary image
-# extensions are handled separately below.
-_QR_IMAGE_PATH = re.compile(r"(?:qrcode|qrencode|gen_qrpic)", re.IGNORECASE)
+# Match explicit QR image endpoint names as full path segments. In particular,
+# ``/qr-login`` is an activation page, not an image endpoint.
+_QR_IMAGE_PATH = re.compile(
+    r"(?:^|/)(?:qrcode|qr[-_]code|qrpic|qr[-_]image|qrencode|gen_qrpic)(?:$|[/.])|(?:^|/)qr(?:/|$)",
+    re.IGNORECASE,
+)
 _QR_IMAGE_EXT = re.compile(r"\.(?:png|jpe?g|webp|gif|bmp)(?:$|[?#])", re.IGNORECASE)
 
 
 def _is_remote_image_url(value: str) -> bool:
-    """Recognise an HTTPS provider QR bitmap URL conservatively."""
+    """Recognise explicit HTTPS provider QR image endpoints conservatively."""
 
     if not _is_https_url(value):
         return False
@@ -328,21 +387,25 @@ def _generated_image(
         if scale < 1:
             raise QrError("generated QR canvas is too small for its module grid")
 
-    from PIL import Image, ImageDraw
+    from PIL import Image
 
-    image = Image.new("RGB", (canvas_width, canvas_height), "white")
-    offset_x = (canvas_width - side * scale) // 2
-    offset_y = (canvas_height - side * scale) // 2
-    draw = ImageDraw.Draw(image)
+    # Render each module as an integer-sized black/white block. Interpolation
+    # creates grey finder edges that some terminal image protocols quantize
+    # into an unreadable QR.
+    modules = Image.new("RGB", (side, side), "white")
+    pixels = modules.load()
     for y, row in enumerate(matrix):
-        top = offset_y + y * scale
         for x, dark in enumerate(row):
             if dark:
-                left = offset_x + x * scale
-                draw.rectangle(
-                    (left, top, left + scale - 1, top + scale - 1),
-                    fill="black",
-                )
+                pixels[x, y] = (0, 0, 0)
+    body = modules.resize((side * scale, side * scale), Image.Resampling.NEAREST)
+    if body.size == (canvas_width, canvas_height):
+        return body
+    image = Image.new("RGB", (canvas_width, canvas_height), "white")
+    image.paste(
+        body,
+        ((canvas_width - side * scale) // 2, (canvas_height - side * scale) // 2),
+    )
     return image
 
 
@@ -415,18 +478,26 @@ def _matrix_from_image(image: Image.Image) -> Matrix:
     from PIL import ImageOps
 
     gray = ImageOps.grayscale(image)
-    samples: dict[int, Matrix] = {}
     best: tuple[float, int, int, Matrix] | None = None
+    # Both polarities occur in official artwork. Sample once and invert the
+    # modules, rather than re-encoding a different login URL on a parse failure.
+    samples: dict[int, Matrix] = {}
+    inverted: dict[int, Matrix] = {}
     for version in range(1, 41):
         modules = 17 + version * 4
         for border in range(0, 9):
             side = modules + border * 2
-            grid = samples.get(side)
-            if grid is None:
-                grid = samples[side] = _sample(gray, side)
-            score = _finder_score(grid, modules, border)
-            if best is None or score > best[0]:
-                best = (score, modules, border, grid)
+            if side not in samples:
+                samples[side] = _sample(gray, side)
+                inverted[side] = tuple(tuple(not cell for cell in row) for row in samples[side])
+            for grid in (samples[side], inverted[side]):
+                score = _finder_score(grid, modules, border)
+                if best is None or score > best[0]:
+                    best = (score, modules, border, grid)
+            if best is not None and best[0] == 1.0:
+                break
+        if best is not None and best[0] == 1.0:
+            break
 
     if best is None or best[0] < 0.88:
         raise QrError("QR image module grid could not be recovered reliably")
@@ -435,4 +506,4 @@ def _matrix_from_image(image: Image.Image) -> Matrix:
     return _pad(core)
 
 
-__all__ = ["Matrix", "QrError", "QrPresentation"]
+__all__ = ["Matrix", "QrError", "QrPresentation", "add_activation_code"]

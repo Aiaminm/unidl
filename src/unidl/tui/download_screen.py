@@ -315,7 +315,7 @@ class DownloadScreen(AskHost):
             return
         button = found.first(ChromeButton)
         if self.controller.job_running or getattr(self.controller, "title_delay_active", False):
-            if self.controller.cancel_requested:
+            if self.controller.cancel_requested or getattr(self.controller, "recording_stop_requested", False):
                 button.set_label("…", "Stopping")
                 button.set_enabled(False)
             elif self.controller.pause_requested:
@@ -845,13 +845,16 @@ class DownloadScreen(AskHost):
 
     # -------------------------------------------------------------- navigation
     def back_without_ask(self) -> bool:
-        """Cancel an active transfer, then return to the immediate parent page.
+        """Finish live capture or cancel VOD, then return to the parent page.
 
         Back is navigation, not a two-stage stop/confirm control.  A running
-        native job is asked to stop before this screen is popped; the controller
+        VOD job is asked to stop before this screen is popped; the controller
         keeps the worker and service flow alive long enough to finish cleanup and
         route the next ask to the page underneath.
         """
+        stop_recording = getattr(self.controller, "request_recording_back", None)
+        if callable(stop_recording) and stop_recording():
+            return True
         if self.controller.job_running or getattr(self.controller, "title_delay_active", False):
             if self.controller.request_cancel():
                 self.notify(tr("delivery.notify.stopping"), timeout=4)
