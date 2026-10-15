@@ -1104,6 +1104,9 @@ def _infer_media_type(item: dict[str, Any]) -> str:
         return "audio"
     if any(token in text for token in ("subtitle", "text", "vtt", "webvtt", "ttml", "srt")):
         return "subtitle"
+    codec = str(item.get("codec") or item.get("codecs") or item.get("format") or item.get("profile") or "").lower()
+    if codec in {"ass", "ssa"}:
+        return "subtitle"
     return "video"
 
 
@@ -1305,6 +1308,8 @@ def _extension(item: dict[str, Any], url: str, media_type: str) -> str | None:
         return name.rsplit(".", 1)[-1].lower()
     codec = (_str_or_none(item.get("codec") or item.get("codecs") or item.get("format")) or "").lower()
     if media_type == "subtitle":
+        if codec in {"ass", "ssa"}:
+            return codec
         if "srt" in codec:
             return "srt"
         if any(token in codec for token in ("ttml", "dfxp", "stpp")):

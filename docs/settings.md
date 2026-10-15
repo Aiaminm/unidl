@@ -190,10 +190,10 @@ heartbeat interval is part of the shared settings contract.
 | `title_delay` | `off`, `30`, or `20-40` | `off` | Compatibility key controlled by **Download behavior**. Adds a random or fixed delay between automatically queued VOD titles. It does not delay tracks within one title or live recording segments. |
 | `muxer` | `auto` / `ffmpeg` / `mkvmerge` | `auto` | Compatibility key controlled by **Download behavior**. Which mux tool writes the final file. Per-service **Container** still chooses mkv vs mp4. |
 | `segment_downloader` | `python` / `aria2c` | `python` | Compatibility key controlled by **Download behavior**. `aria2c` is used only when chosen and installed. |
-| `resume_parts` | on / off | on | Compatibility key controlled by **Download behavior**. Reuse verified tmp parts after a pause or retry. |
+| `resume_parts` | on / off | on | Compatibility key controlled by **Download behavior**. Reuse verified segments and completed track-stage checkpoints after failure or cancellation. Off starts fresh. |
 | `check_segments_count` | on / off | on | Compatibility key controlled by **Download behavior**. Fail a track whose downloaded part count does not match the manifest. |
 | `keep_temp` | on / off | off | Compatibility key controlled by **Download behavior**. Debug mode also keeps temp files. |
-| `keep_failed_intermediates` | on / off | off | Compatibility key controlled by **Download behavior**. Keeps failed VOD track/mux staging for debugging. It does not change segment-cache retention (`keep_temp`). Captured live recordings are preserved on Quit or failure regardless of this setting. |
+| `keep_failed_intermediates` | on / off | off | Compatibility key controlled by **Download behavior**. Keeps failed VOD track/mux staging for debugging. Valid resume checkpoints are separate and follow `resume_parts`; `keep_temp` controls retention after success. Captured live recordings are preserved on Quit or failure regardless of this setting. |
 | `delete_temp_after_done` | on / off | on | Compatibility key controlled by **Download behavior**. Remove temp directories after a successful title. |
 | `auto_subtitle_fix` | on / off | on | Compatibility key controlled by **Download behavior**. Tidy converted subtitle cues. |
 | `live_real_time_merge` | on / off | on | Compatibility key controlled by **Download behavior**. Append live segments while recording. |

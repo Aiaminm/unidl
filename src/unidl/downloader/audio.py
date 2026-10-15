@@ -4,12 +4,15 @@ import hashlib
 import json
 import os
 import shutil
+import subprocess
+import sys
 import tempfile
 import threading
 from pathlib import Path
 from typing import Any
 from urllib.parse import unquote, urljoin, urlparse
 
+from .embedding import managed_run
 from .loader import LoadError, load_bytes
 from .postprocess import _run_external
 from .utils import WINDOWS_INTERMEDIATE_PATH_LIMIT, bounded_path, safe_temp_root, unique_path
@@ -214,7 +217,8 @@ def transcode_audio(
     cover = Path(cover_path) if cover_path else None
     chapter_temp_dir: Path | None = None
     try:
-        args = [executable, "-hide_banner", "-nostdin", "-y", "-i", str(input_path)]
+        decoder_args = _macos_xhe_aac_decoder_args(executable, input_path, copy_audio=copy_audio or target_format == "m4a")
+        args = [executable, "-hide_banner", "-nostdin", "-y", *decoder_args, "-i", str(input_path)]
         next_input = 1
         if cover is not None:
             args.extend(["-i", str(cover)])
@@ -286,6 +290,63 @@ def transcode_audio(
     finally:
         if chapter_temp_dir is not None:
             shutil.rmtree(chapter_temp_dir, ignore_errors=True)
+
+
+def _macos_xhe_aac_decoder_args(executable: str, input_path: Path, *, copy_audio: bool) -> list[str]:
+    """Use AudioToolbox only for verified xHE-AAC transcoding on macOS.
+
+    Keep stream copying and every other platform/codec on the existing path.
+    Probe the actual first audio stream, not a filename or service hint. A
+    short decode verifies this FFmpeg build and OS can handle this file before
+    starting a potentially long encode. No PCM file is materialised.
+    """
+    if sys.platform != "darwin" or copy_audio:
+        return []
+    probe = shutil.which("ffprobe")
+    if not probe:
+        return []
+    try:
+        result = managed_run(
+            [probe, "-v", "error", "-select_streams", "a:0",
+             "-show_entries", "stream=codec_name,profile", "-of", "json", str(input_path)],
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=15,
+        )
+        if result.returncode:
+            return []
+        metadata = json.loads(result.stdout)
+    except (OSError, subprocess.TimeoutExpired, ValueError):
+        return []
+    streams = metadata.get("streams") if isinstance(metadata, dict) else None
+    if not isinstance(streams, list) or not streams or not isinstance(streams[0], dict):
+        return []
+    stream = streams[0]
+    profile = str(stream.get("profile") or "").strip().lower()
+    if stream.get("codec_name") != "aac" or profile not in {"xhe-aac", "usac"}:
+        return []
+
+    message = (
+        "macOS xHE-AAC transcoding requires a working AudioToolbox (aac_at) decoder in FFmpeg; "
+        "a short validation decode failed. The source audio has not been changed."
+    )
+    try:
+        result = managed_run(
+            [executable, "-hide_banner", "-nostdin", "-nostats", "-v", "error", "-xerror",
+             "-c:a", "aac_at", "-i", str(input_path), "-map", "0:a:0", "-vn", "-sn", "-dn",
+             "-t", "1", "-c:a", "pcm_s16le", "-progress", "pipe:1", "-f", "null", "-"],
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=15,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeError(message) from exc
+    produced_audio = any(
+        line.startswith("out_time_us=") and line.partition("=")[2].isdigit() and int(line.partition("=")[2]) > 0
+        for line in (result.stdout or "").splitlines()
+    )
+    if result.returncode or not produced_audio:
+        raise RuntimeError(message)
+    # The decoder option is input-scoped; output encoders, tags, chapters and
+    # channel/sample-rate negotiation below remain exactly as before. Fail on
+    # later decode errors rather than passing invalid PCM to an encoder.
+    return ["-xerror", "-c:a", "aac_at"]
 
 
 def _metadata_value(value: Any) -> str | None:

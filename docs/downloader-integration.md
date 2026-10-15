@@ -107,6 +107,15 @@ cancellation or mux failure. Invalid subtitles fail with a subtitle-preparation
 error rather than being silently discarded; downloaded media remains available.
 Existing SRT/VTT and audio/video inputs keep their normal path.
 
+## ASS/SSA subtitle inputs
+
+ASS/SSA tracks retain their input extensions, including codec-only JSON tracks.
+Content-based recognition handles ASS/SSA text mislabeled as TTML or WebVTT
+without treating header-like dialogue as a script. Recognized empty subtitle
+documents do not cause an FFmpeg conversion warning. See
+[ASS/SSA subtitle inputs](downloader/ass-subtitles.md) for conversion,
+plain-text timing repair and style-preservation behavior.
+
 ## Migration gates
 
 1. One UniDL distribution contains the service layer and download engine; no

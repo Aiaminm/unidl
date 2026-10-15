@@ -123,6 +123,20 @@ If the selected source is already identified as MP3, the audio stream is copied 
 
 All MP3 outputs use ID3v2.3.
 
+### macOS xHE-AAC decoder compatibility
+
+When transcoding xHE-AAC on macOS, UniDL checks the first audio stream's
+actual codec/profile with FFprobe, then verifies FFmpeg's AudioToolbox
+(`aac_at`) decoder with a short decode. Only a successful validation enables
+that input decoder for MP3, FLAC or ALAC conversion. Decode errors stop the
+conversion instead of being ignored; sample-rate and channel negotiation,
+metadata, cover art and chapters retain their existing behavior.
+
+This compatibility path does not run on Windows or Linux, for other audio
+profiles, or for stream-copy operations. M4A output still copies the original
+audio codec: it does not convert xHE-AAC into AAC-LC or guarantee that a player
+can decode xHE-AAC.
+
 ## Pure-Audio Output Logic
 
 When the selection contains only audio tracks, UniDL does not automatically combine them.

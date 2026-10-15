@@ -9,7 +9,7 @@ from collections.abc import Callable, Iterable
 from dataclasses import dataclass, replace
 from pathlib import Path
 
-from .cenc_fragment import CencInitMetadata, decrypt_cenc_fragment, load_cenc_init_metadata
+from .cenc_fragment import CencInitMetadata, CencProgressCallback, decrypt_cenc_fragment, load_cenc_init_metadata
 from .embedding import managed_run
 from .subtitles import SubtitleConversionError, convert_subtitle_file
 from .utils import WINDOWS_INTERMEDIATE_PATH_LIMIT, bounded_path, looks_like_h266, safe_temp_root
@@ -118,6 +118,7 @@ def decrypt_file(
     output_path: str | Path | None = None,
     expected_kids: Iterable[str | None] | None = None,
     event_callback: DecryptEventCallback | None = None,
+    progress_callback: CencProgressCallback | None = None,
 ) -> Path:
     if not keys:
         raise ValueError("Encrypted stream needs at least one --key KID:KEY or --key KEY.")
@@ -128,7 +129,7 @@ def decrypt_file(
     label = "internal MP4/CENC/CBCS"
     _report_decrypt_event(event_callback, f"engine: {label}")
     try:
-        internal_output = _decrypt_internal_mp4_file(input_path, output, keys, expected_kids)
+        internal_output = _decrypt_internal_mp4_file(input_path, output, keys, expected_kids, progress_callback)
         if internal_output is not None:
             return internal_output
         message = "unsupported MP4 CENC/CBCS layout"
@@ -150,6 +151,7 @@ def _decrypt_internal_mp4_file(
     output: Path,
     keys: list[RawKey],
     expected_kids: Iterable[str | None] | None = None,
+    progress_callback: CencProgressCallback | None = None,
 ) -> Path | None:
     decrypted = decrypt_cenc_fragment(
         input_path,
@@ -158,6 +160,7 @@ def _decrypt_internal_mp4_file(
         expected_kids,
         init_path=input_path,
         data_callback=_patch_encrypted_sample_entries,
+        progress_callback=progress_callback,
     )
     if decrypted is None:
         return None

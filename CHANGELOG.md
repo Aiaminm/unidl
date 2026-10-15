@@ -1,5 +1,24 @@
 # Changelog
 
+## [2.4.0] - 2026-10-15
+
+### Subtitles
+
+- Improved ASS/SSA input detection, preserved subtitle extensions and styles, and handled valid empty subtitle documents without unnecessary conversion warnings.
+
+### macOS audio
+
+- Added a validated AudioToolbox decoder path for xHE-AAC transcoding on macOS while leaving stream-copy output and other platforms unchanged.
+
+### Decryption performance
+
+- Accelerated fragmented MP4 audio/video decryption range lookups and added progress reporting for whole-file CENC processing.
+
+### Resume and file cleanup
+
+- Added verified checkpoints for completed download, decryption and processing stages so retries could reuse prepared tracks after cancellation or mux failure.
+- Kept valid resume checkpoints separate from failed intermediate files and deferred cache cleanup until successful output commit.
+
 ## [2.3.9] - 2026-10-14
 
 ### QR sign-in

@@ -1036,7 +1036,7 @@ GLOBAL_SETTINGS: list[Setting] = [
         "Reuse downloaded segments",
         "bool",
         default=True,
-        help="On, verified parts in tmp are reused after a pause or a retry. Off starts every track from scratch.",
+        help="On, reuse verified segments and completed download/decrypt/processing checkpoints after failure or cancellation. Off starts every track from scratch.",
         visible=False,
     ),
     Setting(
@@ -1052,7 +1052,7 @@ GLOBAL_SETTINGS: list[Setting] = [
         "Keep temporary files",
         "bool",
         default=False,
-        help="Keep segment caches after a successful download. Debug mode also keeps them.",
+        help="Keep segment and track-stage caches after a successful download. Debug mode also keeps them. This is not required for failure recovery.",
         visible=False,
     ),
     Setting(
@@ -1062,8 +1062,8 @@ GLOBAL_SETTINGS: list[Setting] = [
         default=False,
         help=(
             "Keep staged video, audio, subtitle and failed mux files in the task "
-            "workspace after a failed delivery for debugging. This does not keep "
-            "segment caches; that is controlled by Keep temporary files."
+            "workspace after a failed delivery for debugging. Verified resume "
+            "checkpoints remain independent and follow Reuse downloaded segments."
         ),
         visible=False,
     ),

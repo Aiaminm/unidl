@@ -5,7 +5,7 @@ from urllib.parse import urlparse
 
 from .utils import is_url
 
-DIRECT_EXTENSIONS = {"mp3", "mp4", "m4a", "m4v", "aac", "flac", "wav", "ts", "m2ts", "mov"}
+DIRECT_EXTENSIONS = {"mp3", "mp4", "m4a", "m4v", "aac", "flac", "wav", "ts", "m2ts", "mov", "ass", "ssa"}
 
 
 def guess_kind(source: str, content: str | None = None) -> str:

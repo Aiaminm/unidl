@@ -50,6 +50,7 @@ from .utils import (
 
 KNOWN_OUTPUT_SUFFIXES = {
     ".aac",
+    ".ass",
     ".ac3",
     ".bbts",
     ".eac3",
@@ -61,6 +62,7 @@ KNOWN_OUTPUT_SUFFIXES = {
     ".mp3",
     ".mp4",
     ".srt",
+    ".ssa",
     ".ts",
     ".ttml",
     ".vtt",
@@ -3895,10 +3897,12 @@ def _default_extension(stream: StreamInfo) -> str:
     extension = (stream.extension or "").lower()
     if extension == "bbts":
         return "ts"
-    if extension in {"ts", "mp3", "m4a", "mp4", "vtt", "srt", "ttml", "webm"}:
+    if extension in {"ts", "mp3", "m4a", "mp4", "vtt", "srt", "ass", "ssa", "ttml", "webm"}:
         return extension
     if stream.media_type == "subtitle":
         codec = (stream.codecs or "").lower()
+        if codec in {"ass", "ssa"}:
+            return codec
         if extension in {"m4s", "m4v", "mov"} and any(token in codec for token in ("wvtt", "stpp", "ttml")):
             return "mp4"
         return "vtt" if extension == "webvtt" else "ttml"

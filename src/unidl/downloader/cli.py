@@ -42,6 +42,7 @@ from .chapters import ChapterFileError, load_chapters_file
 from .console import Palette, color_enabled, paint
 from .downloader import (
     DownloadError,
+    DownloadResult,
     HlsCrypto,
     ProgressUpdate,
     _default_tmp_root,
@@ -125,6 +126,7 @@ from .postprocess import (
 from .sample_aes import decrypt_sample_aes_parts, uses_legacy_sample_aes
 from .selection import SelectionOptions, select_streams
 from .subtitles import SubtitleConversionError, convert_subtitle_file
+from .track_resume import TrackCheckpoint, task_cache_lock
 from .utils import (
     WINDOWS_INTERMEDIATE_PATH_LIMIT,
     bounded_child_path,
@@ -793,15 +795,17 @@ def _list(args: argparse.Namespace) -> int:
 
 def _download(args: argparse.Namespace) -> int:
     """Run one delivery and always settle its staged work directory."""
-    try:
-        result = _download_impl(args)
-    except BaseException:
-        _settle_live_recording(args, success=False)
-        _settle_task_workspace(args, success=False)
-        raise
-    _settle_live_recording(args, success=result == 0)
-    _settle_task_workspace(args, success=result == 0)
-    return result
+    with contextlib.ExitStack() as stack:
+        args._unidown_cache_stack = stack
+        try:
+            result = _download_impl(args)
+        except BaseException:
+            _settle_live_recording(args, success=False)
+            _settle_task_workspace(args, success=False)
+            raise
+        _settle_live_recording(args, success=result == 0)
+        _settle_task_workspace(args, success=result == 0)
+        return result
 
 
 def _download_impl(args: argparse.Namespace) -> int:
@@ -941,11 +945,15 @@ def _download_impl(args: argparse.Namespace) -> int:
     output_dir.mkdir(parents=True, exist_ok=True)
     default_save_base = _default_save_base(args.input, hydrated) if not args.save_name else None
     task_temp_root = _task_temp_root(args, hydrated, default_save_base)
+    stack = getattr(args, "_unidown_cache_stack", None)
+    if stack is not None and not any(stream.is_live and not args.live_perform_as_vod for stream in hydrated):
+        stack.enter_context(task_cache_lock(task_temp_root, lambda: _checkpoint_embedding(args)))
     _migrate_legacy_task_temp_roots(args, hydrated, default_save_base, task_temp_root)
     args._unidown_task_temp_root = task_temp_root
     task_workspace = _task_workspace_root(args, task_temp_root, output_dir)
     args._unidown_task_workspace = task_workspace
     args._unidown_commit_targets = {}
+    args._unidown_sibling_failure = threading.Event()
     staged_output_dir = task_workspace / "tracks"
     downloaded_paths: list[Path] = []
     downloaded_tracks: list[_DownloadedTrack] = []
@@ -1135,6 +1143,7 @@ def _download_impl(args: argparse.Namespace) -> int:
             for future in as_completed(futures):
                 completed.append(future.result())
         except BaseException:
+            args._unidown_sibling_failure.set()
             _cancel_futures_now(pool, futures)
             raise
         else:
@@ -1188,9 +1197,8 @@ def _download_impl(args: argparse.Namespace) -> int:
     should_mux = _should_mux_after_download(args, mux_imports, downloaded_paths, hydrated)
     protected_paths = list(downloaded_paths)
     if should_mux:
-        # Muxing needs another output-sized allocation. Release resumable
-        # segment caches before checking free space and starting the muxer.
-        _cleanup_temp_dirs(temp_dirs, args, colors)
+        # Track checkpoints replace redundant parts as each track completes.
+        # Do not remove those checkpoints before mux AND final commit succeed.
         vvc_vod = _tracks_include_vvc(downloaded_tracks)
         mux_format = _mux_format_for_tracks(downloaded_tracks, args, live=False)
         mux_destination = _mux_output_path(
@@ -1227,9 +1235,6 @@ def _download_impl(args: argparse.Namespace) -> int:
         _log_line(args, f"Muxed: {muxed}")
         _log_line(args, f"Elapsed: {format_time(max(0.0, time.monotonic() - task_started_at)) or '0s'}")
         protected_paths = [muxed]
-    _cleanup_intermediate_files(intermediate_paths, protected=protected_paths, args=args, colors=colors)
-    _cleanup_temp_dirs(temp_dirs, args, colors)
-    _print_cleanup_summary(args, colors)
     protected_paths, metadata_paths = _commit_task_outputs(
         args,
         output_dir,
@@ -1237,6 +1242,9 @@ def _download_impl(args: argparse.Namespace) -> int:
         downloaded_tracks,
         metadata_paths,
     )
+    _cleanup_intermediate_files(intermediate_paths, protected=protected_paths, args=args, colors=colors)
+    _cleanup_temp_dirs(temp_dirs, args, colors)
+    _print_cleanup_summary(args, colors)
     _emit_download_artifacts(
         args,
         protected_paths,
@@ -1405,6 +1413,7 @@ class _TrackStatusSpinner:
     def __init__(self, reporter: _TrackStatusReporter, states: Sequence[str]):
         self.reporter = reporter
         self.states = tuple(states)
+        self.progress: str = ""
         self.stop_event = threading.Event()
         self.thread: threading.Thread | None = None
 
@@ -1431,9 +1440,19 @@ class _TrackStatusSpinner:
             self._render(frame_index)
             frame_index += 1
 
+    def set_progress(self, completed: int, total: int) -> None:
+        if total <= 0:
+            return
+        self.progress = f" {min(1.0, max(0.0, completed / total)):.1%}"
+        if self.thread is None:
+            self._render(0)
+
     def _render(self, frame_index: int) -> None:
         frame = self.reporter.spinner_frames[frame_index % len(self.reporter.spinner_frames)]
-        self.reporter.update(*_spinner_states(self.states, frame))
+        states = list(_spinner_states(self.states, frame))
+        if states and self.progress:
+            states[-1] += self.progress
+        self.reporter.update(*states)
 
 
 class _TaskStatusLine:
@@ -1690,6 +1709,9 @@ def _embedding_console_progress(args) -> bool:
 
 
 def _check_embedding_cancelled(args) -> None:
+    sibling_failure = getattr(args, "_unidown_sibling_failure", None)
+    if sibling_failure is not None and sibling_failure.is_set():
+        raise DownloadCancelled("another track failed")
     callback = _embedding_cancel_callback(args)
     if callback is not None and callback():
         raise DownloadCancelled("download cancelled")
@@ -1894,6 +1916,12 @@ _COMPLETED_TRACK_CACHE_VERSION = 1
 def _completed_track_cache_identity(stream, filename: str | None, args: argparse.Namespace) -> dict:
     return {
         "stream_key": _stream_resume_key(stream),
+        "track_shape": {
+            key: getattr(stream, key, None)
+            for key in ("codecs", "channels", "role", "duration", "encrypted", "encryption_scheme")
+        },
+        "key_ids": sorted(_stream_key_ids(stream)),
+        "custom_range": getattr(args, "custom_range", None),
         "filename": filename,
         "save_pattern": getattr(args, "save_pattern", None),
         "no_decrypt": bool(getattr(args, "no_decrypt", False)),
@@ -1901,6 +1929,10 @@ def _completed_track_cache_identity(stream, filename: str | None, args: argparse
         "audio_format": (getattr(args, "audio_format", None) or "").lower() or None,
         "audio_metadata": audio_metadata_signature(stream) if getattr(args, "audio_format", None) else None,
         "sub_format": (getattr(args, "sub_format", "srt") or "srt").lower(),
+        "auto_subtitle_fix": bool(getattr(args, "auto_subtitle_fix", True)),
+        "audio_vivid_decoder": getattr(args, "audio_vivid_decoder", None),
+        "audio_vivid_decoder_args": getattr(args, "audio_vivid_decoder_args", None),
+        "decode_audio_vivid": bool(getattr(args, "decode_audio_vivid", False)),
         "vgc": bool(getattr(args, "vgc", False)),
         "vgc_keep_opaque": bool(getattr(args, "vgc_keep_opaque", False)),
     }
@@ -2044,7 +2076,19 @@ def _download_selected_stream(
     )
     original_index = _stream_original_index(all_streams, stream, offset)
     status = _TrackStatusReporter(original_index, stream, emit, colors, status_callback, force=getattr(args, "force_ansi_console", False))
-    cached = _load_completed_track_cache(stream, name, args)
+    checkpoint = TrackCheckpoint(
+        _task_temp_subdir(args, "checkpoints"),
+        _completed_track_cache_identity(stream, name, args),
+        output_dir,
+        enabled=not args.no_resume,
+        keep=bool(args.keep_temp or not getattr(args, "del_after_done", True)),
+    )
+    checkpoint.restore(stream)
+    cached = (
+        _CompletedTrackCache(checkpoint.path, [checkpoint.path])
+        if checkpoint.reached("ready") and checkpoint.path is not None
+        else _load_completed_track_cache(stream, name, args)
+    )
     if cached is not None:
         cached_path = cached.path
         cleanup_paths = list(cached.cleanup_paths)
@@ -2063,6 +2107,10 @@ def _download_selected_stream(
                 cleanup_paths.append(cached_path)
         status.set_path(cached_path)
         status.update("Downloaded ✓", "Cached ✓")
+        if not checkpoint.reached("ready"):
+            # Adopt still-valid legacy completed-track markers into the durable
+            # cache before a peer failure can remove their old workspace.
+            checkpoint.save("ready", cached_path, DownloadResult(stream, cached_path))
         status.finish()
         _log_line(args, f"Cached: {cached_path}")
         return _DownloadedTrack(
@@ -2073,7 +2121,7 @@ def _download_selected_stream(
             cleanup_paths=cleanup_paths,
             cache_filename=name,
         )
-    if stream.encrypted and not args.no_decrypt:
+    if stream.encrypted and not args.no_decrypt and not checkpoint.reached("decrypted"):
         _ensure_hls_segment_crypto_ready([stream], hls_crypto)
         if _stream_uses_bbts(stream):
             _bbts_key_hex(keys, hls_crypto, stream)
@@ -2084,25 +2132,31 @@ def _download_selected_stream(
         effective_workers = workers or args.workers
         if getattr(args, "vgc", False) and _is_subtitle_stream(stream):
             effective_workers = 1
-        result = download_stream(
-            stream,
-            output_dir=output_dir,
-            filename=name,
-            headers=headers,
-            workers=effective_workers,
-            retries=args.retries,
-            keep_temp=args.keep_temp or _stream_needs_fragment_parts(stream) or (uses_legacy_sample_aes(stream) and not args.no_decrypt) or (_stream_uses_webm_container(stream) and stream.encrypted and not args.no_decrypt),
-            downloader=args.downloader,
-            progress=progress,
-            temp_dir=_task_temp_subdir(args, "vod"),
-            resume=not args.no_resume,
-            max_speed=max_speed,
-            hls_crypto=hls_crypto,
-            request_timeout=max(1, args.http_request_timeout),
-            check_segments_count=getattr(args, "check_segments_count", True),
-            assemble_output=not _should_skip_assembled_download_output(stream, args, hls_crypto),
-            gate=lambda: _checkpoint_embedding(args),
-        )
+        result = checkpoint.result
+        if result is None:
+            result = download_stream(
+                stream,
+                output_dir=output_dir,
+                filename=name,
+                headers=headers,
+                workers=effective_workers,
+                retries=args.retries,
+                keep_temp=args.keep_temp or _stream_needs_fragment_parts(stream) or (uses_legacy_sample_aes(stream) and not args.no_decrypt) or (_stream_uses_webm_container(stream) and stream.encrypted and not args.no_decrypt),
+                downloader=args.downloader,
+                progress=progress,
+                temp_dir=_task_temp_subdir(args, "vod"),
+                resume=not args.no_resume,
+                max_speed=max_speed,
+                hls_crypto=hls_crypto,
+                request_timeout=max(1, args.http_request_timeout),
+                check_segments_count=getattr(args, "check_segments_count", True),
+                assemble_output=not _should_skip_assembled_download_output(stream, args, hls_crypto),
+                gate=lambda: _checkpoint_embedding(args),
+            )
+            checkpoint.save("downloaded", result.path, result)
+        else:
+            emit(f"{paint('Cached:', Palette.green, colors)} {checkpoint.phase}")
+
     except (DownloadCancelled, KeyboardInterrupt):
         if isinstance(progress_display, _DownloadProgress):
             progress_display.cancel()
@@ -2114,188 +2168,200 @@ def _download_selected_stream(
     else:
         if isinstance(progress_display, _DownloadProgress):
             progress_display.finish()
-    current_path = result.path
+    current_path = checkpoint.path or result.path
     cleanup_paths = [current_path]
-    if _is_sabr_stream(stream):
-        _apply_sniffed_sabr_container_from_path(stream, current_path)
-    status.set_path(current_path)
-    status.update("Downloaded ✓")
-    _log_line(args, f"Downloaded: {current_path}")
     result_temp_dir = result.temp_dir
-    if _should_finalize_clear_hls_sections(stream, result, hls_crypto):
-        with status.spinning("Downloaded ✓", "Finalizing {spinner}"):
-            current_path = _finalize_clear_hls_sections(stream, result, current_path)
-        status.update("Downloaded ✓", "Finalized ✓")
-        _log_line(args, f"Finalized: {current_path}")
-    if not _download_parts_needed_for_postprocess(stream, result, hls_crypto, args):
-        result_temp_dir = _cleanup_track_temp_dir(result_temp_dir, args, colors)
-
-    if _stream_uses_bbts(stream) and not args.no_decrypt:
-        previous_path = current_path
-        with status.spinning("Downloaded ✓", "Decrypting {spinner}"):
-            current_path = decrypt_bbts_file(
-                current_path,
-                bounded_path(current_path.with_suffix(".dec.ts"), max_length=WINDOWS_INTERMEDIATE_PATH_LIMIT),
-                _bbts_key_hex(keys, hls_crypto, stream),
-            )
-        _cleanup_replaced_intermediate(previous_path, current_path, args, colors)
-        if current_path not in cleanup_paths:
-            cleanup_paths.append(current_path)
-        status.update("Downloaded ✓", "Decrypted ✓")
-        _log_line(args, f"Decrypted: {current_path}")
-    elif _stream_uses_webm_container(stream) and _stream_needs_external_decryption(stream, hls_crypto) and not args.no_decrypt:
-        previous_path = current_path
-        decrypt_context = _decrypt_event_context(original_index, stream)
-        decrypt_events, decrypt_event = _new_decrypt_event_recorder(args, decrypt_context)
-        try:
+    if not checkpoint.reached("decrypted"):
+        if _is_sabr_stream(stream):
+            _apply_sniffed_sabr_container_from_path(stream, current_path)
+        status.set_path(current_path)
+        status.update("Downloaded ✓")
+        _log_line(args, f"Downloaded: {current_path}")
+        if _should_finalize_clear_hls_sections(stream, result, hls_crypto):
+            with status.spinning("Downloaded ✓", "Finalizing {spinner}"):
+                current_path = _finalize_clear_hls_sections(stream, result, current_path)
+            status.update("Downloaded ✓", "Finalized ✓")
+            _log_line(args, f"Finalized: {current_path}")
+        if _stream_uses_bbts(stream) and not args.no_decrypt:
+            previous_path = current_path
             with status.spinning("Downloaded ✓", "Decrypting {spinner}"):
-                current_path = _decrypt_webm_output(
+                current_path = decrypt_bbts_file(
                     current_path,
-                    stream,
-                    result,
-                    keys,
-                    args.decrypter,
-                    bounded_path(current_path.with_suffix(".dec.webm"), max_length=WINDOWS_INTERMEDIATE_PATH_LIMIT),
-                    event_callback=decrypt_event,
+                    bounded_path(current_path.with_suffix(".dec.ts"), max_length=WINDOWS_INTERMEDIATE_PATH_LIMIT),
+                    _bbts_key_hex(keys, hls_crypto, stream),
                 )
-        except Exception:
+            _cleanup_replaced_intermediate(previous_path, current_path, args, colors)
+            if current_path not in cleanup_paths:
+                cleanup_paths.append(current_path)
+            status.update("Downloaded ✓", "Decrypted ✓")
+            _log_line(args, f"Decrypted: {current_path}")
+        elif _stream_uses_webm_container(stream) and _stream_needs_external_decryption(stream, hls_crypto) and not args.no_decrypt:
+            previous_path = current_path
+            decrypt_context = _decrypt_event_context(original_index, stream)
+            decrypt_events, decrypt_event = _new_decrypt_event_recorder(args, decrypt_context)
+            try:
+                with status.spinning("Downloaded ✓", "Decrypting {spinner}"):
+                    current_path = _decrypt_webm_output(
+                        current_path,
+                        stream,
+                        result,
+                        keys,
+                        args.decrypter,
+                        bounded_path(current_path.with_suffix(".dec.webm"), max_length=WINDOWS_INTERMEDIATE_PATH_LIMIT),
+                        event_callback=decrypt_event,
+                    )
+            except Exception:
+                _flush_track_decrypt_events(status, decrypt_events, emit, colors, decrypt_context)
+                raise
             _flush_track_decrypt_events(status, decrypt_events, emit, colors, decrypt_context)
-            raise
-        _flush_track_decrypt_events(status, decrypt_events, emit, colors, decrypt_context)
-        _cleanup_replaced_intermediate(previous_path, current_path, args, colors)
-        if current_path not in cleanup_paths:
-            cleanup_paths.append(current_path)
-        status.update("Downloaded ✓", "Decrypted ✓")
-        _log_line(args, f"Decrypted: {current_path}")
-    elif _stream_needs_external_decryption(stream, hls_crypto) and not args.no_decrypt:
-        previous_path = current_path
-        decrypt_context = _decrypt_event_context(original_index, stream)
-        decrypt_events, decrypt_event = _new_decrypt_event_recorder(args, decrypt_context)
-        try:
-            with status.spinning("Downloaded ✓", "Decrypting {spinner}"):
-                stream_type = "audio" if stream.media_type == "audio" else "video"
-                decrypter = _decrypter_for_stream(args.decrypter, stream)
-                if uses_legacy_sample_aes(stream):
-                    current_path = decrypt_sample_aes_parts(
-                        result.parts or ([current_path] if len(stream.segments) == 1 else []), stream, keys,
-                        bounded_path(current_path.with_suffix(f".dec{current_path.suffix}"), max_length=WINDOWS_INTERMEDIATE_PATH_LIMIT),
-                        temp_dir=_task_temp_subdir(args, "postprocess"),
-                        event_callback=decrypt_event,
-                    )
-                elif _should_decrypt_fragmented_parts(stream, result) and not (
-                    result.sections and _stream_sections_need_timestamp_restamp(stream)
-                ):
-                    current_path = decrypt_fragmented_mp4_parts(
-                        result.parts or [],
-                        stream.segments,
-                        keys=keys,
-                        stream_type=stream_type,
-                        output_path=bounded_path(current_path.with_suffix(f".dec{current_path.suffix}"), max_length=WINDOWS_INTERMEDIATE_PATH_LIMIT),
-                        expected_kids=_stream_key_ids(stream),
-                        temp_dir=_task_temp_subdir(args, "postprocess"),
-                        event_callback=decrypt_event,
-                        restamp_timestamps=_stream_needs_fragment_timestamp_restamp(stream),
-                    )
-                elif result.sections:
-                    if _stream_sections_need_whole_file_decryption(stream):
+            _cleanup_replaced_intermediate(previous_path, current_path, args, colors)
+            if current_path not in cleanup_paths:
+                cleanup_paths.append(current_path)
+            status.update("Downloaded ✓", "Decrypted ✓")
+            _log_line(args, f"Decrypted: {current_path}")
+        elif _stream_needs_external_decryption(stream, hls_crypto) and not args.no_decrypt:
+            previous_path = current_path
+            decrypt_context = _decrypt_event_context(original_index, stream)
+            decrypt_events, decrypt_event = _new_decrypt_event_recorder(args, decrypt_context)
+            try:
+                with status.spinning("Downloaded ✓", "Decrypting {spinner}") as decrypt_status:
+                    stream_type = "audio" if stream.media_type == "audio" else "video"
+                    decrypter = _decrypter_for_stream(args.decrypter, stream)
+                    if uses_legacy_sample_aes(stream):
+                        current_path = decrypt_sample_aes_parts(
+                            result.parts or ([current_path] if len(stream.segments) == 1 else []), stream, keys,
+                            bounded_path(current_path.with_suffix(f".dec{current_path.suffix}"), max_length=WINDOWS_INTERMEDIATE_PATH_LIMIT),
+                            temp_dir=_task_temp_subdir(args, "postprocess"),
+                            event_callback=decrypt_event,
+                        )
+                    elif _should_decrypt_fragmented_parts(stream, result) and not (
+                        result.sections and _stream_sections_need_timestamp_restamp(stream)
+                    ):
+                        current_path = decrypt_fragmented_mp4_parts(
+                            result.parts or [],
+                            stream.segments,
+                            keys=keys,
+                            stream_type=stream_type,
+                            output_path=bounded_path(current_path.with_suffix(f".dec{current_path.suffix}"), max_length=WINDOWS_INTERMEDIATE_PATH_LIMIT),
+                            expected_kids=_stream_key_ids(stream),
+                            temp_dir=_task_temp_subdir(args, "postprocess"),
+                            event_callback=decrypt_event,
+                            restamp_timestamps=_stream_needs_fragment_timestamp_restamp(stream),
+                        )
+                    elif result.sections:
+                        if _stream_sections_need_whole_file_decryption(stream):
+                            current_path = decrypt_file(
+                                current_path,
+                                keys=keys,
+                                decrypter=decrypter,
+                                stream_type=stream_type,
+                                output_path=bounded_path(current_path.with_suffix(f".dec{current_path.suffix}"), max_length=WINDOWS_INTERMEDIATE_PATH_LIMIT),
+                                expected_kids=_stream_key_ids(stream),
+                                event_callback=decrypt_event,
+                                progress_callback=decrypt_status.set_progress,
+                            )
+                        else:
+                            restamp_sections = _stream_sections_need_timestamp_restamp(stream)
+                            section_fragment_durations = _stream_section_fragment_durations(stream) if restamp_sections else None
+                            current_path = decrypt_sections(
+                                result.sections,
+                                keys=keys,
+                                decrypter=decrypter,
+                                stream_type=stream_type,
+                                output_path=bounded_path(current_path.with_suffix(f".dec{current_path.suffix}"), max_length=WINDOWS_INTERMEDIATE_PATH_LIMIT),
+                                expected_kids=_stream_key_ids(stream),
+                                restamp_timestamps=restamp_sections,
+                                section_durations=[sum(durations) for durations in section_fragment_durations] if section_fragment_durations else None,
+                                section_fragment_durations=section_fragment_durations,
+                                normalize_large_composition_offsets=restamp_sections and stream.media_type == "video",
+                                event_callback=decrypt_event,
+                            )
+                    else:
                         current_path = decrypt_file(
                             current_path,
                             keys=keys,
                             decrypter=decrypter,
                             stream_type=stream_type,
-                            output_path=bounded_path(current_path.with_suffix(f".dec{current_path.suffix}"), max_length=WINDOWS_INTERMEDIATE_PATH_LIMIT),
                             expected_kids=_stream_key_ids(stream),
                             event_callback=decrypt_event,
+                            progress_callback=decrypt_status.set_progress,
                         )
-                    else:
-                        restamp_sections = _stream_sections_need_timestamp_restamp(stream)
-                        section_fragment_durations = _stream_section_fragment_durations(stream) if restamp_sections else None
-                        current_path = decrypt_sections(
-                            result.sections,
-                            keys=keys,
-                            decrypter=decrypter,
-                            stream_type=stream_type,
-                            output_path=bounded_path(current_path.with_suffix(f".dec{current_path.suffix}"), max_length=WINDOWS_INTERMEDIATE_PATH_LIMIT),
-                            expected_kids=_stream_key_ids(stream),
-                            restamp_timestamps=restamp_sections,
-                            section_durations=[sum(durations) for durations in section_fragment_durations] if section_fragment_durations else None,
-                            section_fragment_durations=section_fragment_durations,
-                            normalize_large_composition_offsets=restamp_sections and stream.media_type == "video",
-                            event_callback=decrypt_event,
-                        )
-                else:
-                    current_path = decrypt_file(
-                        current_path,
-                        keys=keys,
-                        decrypter=decrypter,
-                        stream_type=stream_type,
-                        expected_kids=_stream_key_ids(stream),
-                        event_callback=decrypt_event,
-                    )
-                if not uses_legacy_sample_aes(stream):
-                    _normalize_hls_video_sample_timing(current_path, stream)
-        except Exception:
+                    if not uses_legacy_sample_aes(stream):
+                        _normalize_hls_video_sample_timing(current_path, stream)
+            except Exception:
+                _flush_track_decrypt_events(status, decrypt_events, emit, colors, decrypt_context)
+                raise
             _flush_track_decrypt_events(status, decrypt_events, emit, colors, decrypt_context)
-            raise
-        _flush_track_decrypt_events(status, decrypt_events, emit, colors, decrypt_context)
-        _cleanup_replaced_intermediate(previous_path, current_path, args, colors)
-        if current_path not in cleanup_paths:
-            cleanup_paths.append(current_path)
-        status.update("Downloaded ✓", "Decrypted ✓")
-        _log_line(args, f"Decrypted: {current_path}")
-    if is_vgc_stream(stream):
-        try:
-            with status.spinning("Downloaded ✓", "Checking VGC {spinner}"):
-                current_path = finalize_vgc_track(current_path, stream, allow_opaque=getattr(args, "vgc_keep_opaque", False))
-        except VgcError as exc:
-            raise RuntimeError(str(exc)) from exc
-        if getattr(args, "vgc_keep_opaque", False):
-            status.update("Downloaded ✓", "VGC raw kept")
-            _log_line(args, f"VGC raw kept: {current_path}")
-        else:
-            status.update("Downloaded ✓", "VGC clear ✓")
-            _log_line(args, f"VGC clear: {current_path}")
-    if args.repack:
-        previous_path = current_path
-        with status.spinning("Downloaded ✓", "Decrypted ✓", "Repacking {spinner}"):
-            current_path = repackage_ffmpeg(current_path)
-        _cleanup_replaced_intermediate(previous_path, current_path, args, colors)
-        if current_path not in cleanup_paths:
-            cleanup_paths.append(current_path)
-        status.update("Downloaded ✓", "Decrypted ✓", "Repacked ✓")
-        _log_line(args, f"Repacked: {current_path}")
-    audio_result = postprocess_audio_vivid(
-        current_path,
-        stream,
-        decoder=getattr(args, "audio_vivid_decoder", None),
-        decoder_args=getattr(args, "audio_vivid_decoder_args", None),
-    )
-    if audio_result.warning:
-        emit(f"{paint('Audio:', Palette.yellow, colors)} {audio_result.warning}")
-        _log_line(args, f"Audio: {audio_result.warning}")
-    elif audio_result.decoded_path is not None:
-        current_path = audio_result.path
-        if current_path not in cleanup_paths:
-            cleanup_paths.append(current_path)
-        status.set_path(current_path)
-        status.update("Downloaded ✓", "Audio Vivid WAV ✓")
-        _log_line(args, f"Audio Vivid WAV: {audio_result.decoded_path}")
-    audio_format = _audio_format_for_stream(stream, args)
-    if audio_format:
-        audio_label = audio_format.upper()
-        previous_path = current_path
-        with status.spinning("Downloaded ✓", f"Finalizing {audio_label} {{spinner}}"):
-            current_path = _transcode_audio_output(current_path, result.path, stream, args, headers)
-        _cleanup_replaced_intermediate(previous_path, current_path, args, colors)
-        if current_path not in cleanup_paths:
-            cleanup_paths.append(current_path)
-        status.set_path(current_path)
-        status.update("Downloaded ✓", f"{audio_label} ✓")
-        _log_line(args, f"{audio_label}: {current_path}")
-    current_path, subtitle_cleanup = _convert_subtitle_output(current_path, stream, args, colors, emit, status)
-    for path in subtitle_cleanup:
-        if path not in cleanup_paths:
-            cleanup_paths.append(path)
+            _cleanup_replaced_intermediate(previous_path, current_path, args, colors)
+            if current_path not in cleanup_paths:
+                cleanup_paths.append(current_path)
+            status.update("Downloaded ✓", "Decrypted ✓")
+            _log_line(args, f"Decrypted: {current_path}")
+        checkpoint.save("decrypted", current_path, result)
+    # A durable clear-track checkpoint now replaces the download parts.
+    if checkpoint.reached("decrypted"):
+        result_temp_dir = _cleanup_track_temp_dir(result_temp_dir, args, colors)
+    if not checkpoint.reached("repacked"):
+        if is_vgc_stream(stream):
+            try:
+                with status.spinning("Downloaded ✓", "Checking VGC {spinner}"):
+                    current_path = finalize_vgc_track(current_path, stream, allow_opaque=getattr(args, "vgc_keep_opaque", False))
+            except VgcError as exc:
+                raise RuntimeError(str(exc)) from exc
+            if getattr(args, "vgc_keep_opaque", False):
+                status.update("Downloaded ✓", "VGC raw kept")
+                _log_line(args, f"VGC raw kept: {current_path}")
+            else:
+                status.update("Downloaded ✓", "VGC clear ✓")
+                _log_line(args, f"VGC clear: {current_path}")
+        if args.repack:
+            previous_path = current_path
+            with status.spinning("Downloaded ✓", "Decrypted ✓", "Repacking {spinner}"):
+                current_path = repackage_ffmpeg(current_path)
+            _cleanup_replaced_intermediate(previous_path, current_path, args, colors)
+            if current_path not in cleanup_paths:
+                cleanup_paths.append(current_path)
+            status.update("Downloaded ✓", "Decrypted ✓", "Repacked ✓")
+            _log_line(args, f"Repacked: {current_path}")
+        checkpoint.save("repacked", current_path, result)
+    if not checkpoint.reached("audio"):
+        audio_result = postprocess_audio_vivid(
+            current_path,
+            stream,
+            decoder=getattr(args, "audio_vivid_decoder", None),
+            decoder_args=getattr(args, "audio_vivid_decoder_args", None),
+        )
+        if audio_result.warning:
+            emit(f"{paint('Audio:', Palette.yellow, colors)} {audio_result.warning}")
+            _log_line(args, f"Audio: {audio_result.warning}")
+        elif audio_result.decoded_path is not None:
+            current_path = audio_result.path
+            if current_path not in cleanup_paths:
+                cleanup_paths.append(current_path)
+            status.set_path(current_path)
+            status.update("Downloaded ✓", "Audio Vivid WAV ✓")
+            _log_line(args, f"Audio Vivid WAV: {audio_result.decoded_path}")
+        checkpoint.save("audio", current_path, result)
+    if not checkpoint.reached("transcoded"):
+        audio_format = _audio_format_for_stream(stream, args)
+        if audio_format:
+            audio_label = audio_format.upper()
+            previous_path = current_path
+            with status.spinning("Downloaded ✓", f"Finalizing {audio_label} {{spinner}}"):
+                current_path = _transcode_audio_output(current_path, result.path, stream, args, headers)
+            _cleanup_replaced_intermediate(previous_path, current_path, args, colors)
+            if current_path not in cleanup_paths:
+                cleanup_paths.append(current_path)
+            status.set_path(current_path)
+            status.update("Downloaded ✓", f"{audio_label} ✓")
+            _log_line(args, f"{audio_label}: {current_path}")
+        checkpoint.save("transcoded", current_path, result)
+    if not checkpoint.reached("ready"):
+        current_path, subtitle_cleanup = _convert_subtitle_output(current_path, stream, args, colors, emit, status)
+        for path in subtitle_cleanup:
+            if path not in cleanup_paths:
+                cleanup_paths.append(path)
+        checkpoint.save("ready", current_path, result)
     _write_completed_track_cache(stream, name, args, current_path, cleanup_paths)
     result_temp_dir = _cleanup_track_temp_dir(result_temp_dir, args, colors)
     status.finish()
@@ -8618,6 +8684,8 @@ def _default_extension_for_pattern(stream) -> str:
         return extension
     if stream.media_type in {"subtitle", "subtitles", "text"}:
         codec = (stream.codecs or "").lower()
+        if codec in {"ass", "ssa"}:
+            return codec
         if extension in {"m4s", "m4v", "mov"} and any(token in codec for token in ("wvtt", "stpp", "ttml")):
             return "mp4"
         return "vtt" if extension == "webvtt" else "ttml"
@@ -8701,7 +8769,9 @@ def _normalize_decrypter_name(value: str) -> str:
 def _cancel_futures_now(pool: ThreadPoolExecutor, futures) -> None:
     for future in futures:
         future.cancel()
-    pool.shutdown(wait=current_download_runtime() is not None, cancel_futures=True)
+    # Workspace cleanup must not race a still-running sibling track, including
+    # the standalone CLI. Gates stop it cooperatively while the owner joins it.
+    pool.shutdown(wait=True, cancel_futures=True)
 
 
 def _selected_mux_format(args: argparse.Namespace, live: bool = False) -> str:

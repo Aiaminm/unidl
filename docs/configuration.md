@@ -103,8 +103,11 @@ staged in an isolated per-task workspace. A successful task commits only its
 finished artifacts to the destination folder. A failed or cancelled task
 removes that workspace by default, so partial files do not accumulate beside
 completed downloads. `keep_failed_intermediates` can be enabled when debugging
-to retain that failed workspace; it is independent from `keep_temp`, which
-controls resumable segment caches. This staging cleanup applies to VOD, not
+to retain that failed workspace. Valid segments and completed track-stage
+checkpoints are separate from failed debris: `resume_parts` enables their
+reuse after failure or cancellation, while `keep_temp` retains caches after
+success. Checkpoints are cleared only after the final output is committed
+successfully. This staging cleanup applies to VOD, not
 captured live recordings. A real-time live mux writes its growing file visibly
 in the service download folder; separate live tracks use a visible
 `<name>.recording/` folder. Back finishes and commits the recording normally,

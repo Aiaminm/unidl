@@ -80,6 +80,43 @@ continues from that byte offset. If the origin does not support Range, UniDL
 discards the prefix and safely starts that file from zero rather than producing
 duplicated media.
 
+## Resuming completed tracks and processing stages
+
+With `resume_parts` enabled, a VOD retry preserves more than unfinished
+segments. Each track publishes a verified checkpoint after download,
+decryption, repacking, audio processing, and subtitle preparation. A failed
+stage cannot replace the previous valid checkpoint. For example, if audio is
+ready but video fails halfway, a retry reuses the prepared audio and continues
+the video's verified parts. If muxing fails, prepared tracks can be reused
+without downloading or decrypting them again.
+
+Checkpoints live under the task's `paths.temp` cache, separately from the
+disposable per-invocation `.work` directory. They are not finished downloads.
+Records are replaced atomically and checked against the track identity,
+processing options, file size, modification time and bounded content samples.
+An absent, changed or incompatible file is not trusted merely because its name
+matches. Tasks sharing a cache are serialized through the final commit so one
+invocation cannot clean another's active inputs.
+
+The three controls have separate jobs:
+
+- `resume_parts`: reuse verified segments and valid stage checkpoints after
+  failure/cancellation. Off bypasses these checkpoints and starts fresh.
+- `keep_temp`: retain caches after success for inspection/reuse; debug mode
+  also enables retention. It is not required for failure recovery.
+- `keep_failed_intermediates`: additionally retain the failed work directory,
+  including incomplete outputs, for debugging. Off removes that debris but
+  does not remove valid resume checkpoints.
+
+Normal cleanup releases redundant parts once a durable track checkpoint
+replaces them. Remaining checkpoints are removed only after the final output
+has been committed successfully, subject to the existing success-retention
+settings. Failed mux outputs are disposable; valid source tracks are not.
+On filesystems supporting hard links, checkpoint media shares the existing
+file data rather than duplicating large tracks. Other filesystems use a
+bounded-memory copy. Live recordings keep their separate visible-file,
+Back-to-finalize and Quit-preservation behavior.
+
 ## What it means for a batch
 
 Cancelling one title cancels the rest. You asked to stop, not to skip one and

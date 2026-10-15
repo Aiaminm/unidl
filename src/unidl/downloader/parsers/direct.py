@@ -51,10 +51,14 @@ def _stream_from_probe(source: str, final_url: str, data: dict | None) -> Stream
     fmt = data.get("format") or {}
     video = next((item for item in streams if item.get("codec_type") == "video"), None)
     audio = next((item for item in streams if item.get("codec_type") == "audio"), None)
-    primary = video or audio
+    subtitle = next(
+        (item for item in streams if item.get("codec_type") == "subtitle" and item.get("codec_name") in {"ass", "ssa"}),
+        None,
+    )
+    primary = video or audio or subtitle
     if primary is None:
         return None
-    media_type = "video" if video else "audio"
+    media_type = "video" if video else "audio" if audio else "subtitle"
     duration = _float_or_none(primary.get("duration")) or _float_or_none(fmt.get("duration"))
     bitrate = _int_or_none(primary.get("bit_rate")) or _int_or_none(fmt.get("bit_rate"))
     width = primary.get("width")
@@ -116,7 +120,7 @@ def _media_type_from_source(source: str, content_type: str | None = None) -> str
     ext = _extension(source)
     if content_type.startswith("audio/") or ext in {"mp3", "m4a", "aac", "flac", "wav"}:
         return "audio"
-    if content_type.startswith("text/") or ext in {"vtt", "srt", "ttml"}:
+    if content_type.startswith("text/") or ext in {"vtt", "srt", "ttml", "ass", "ssa"} or content_type in {"application/x-ass", "application/x-ssa"}:
         return "subtitle"
     return "video"
 

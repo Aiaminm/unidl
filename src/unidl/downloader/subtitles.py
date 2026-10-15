@@ -57,7 +57,18 @@ def convert_subtitle_file(
         return input_path
     if (input_path.suffix.lower().lstrip(".") == target
             and (output_path is None or Path(output_path) == input_path)):
-        return input_path
+        if target == "ass":
+            return input_path
+        # A mislabeled ASS file can already have the requested .srt/.vtt
+        # suffix. Only true same-format text may use this passthrough; convert
+        # discovered ASS to a separate file without overwriting its source.
+        try:
+            same_format_text = input_path.read_text(encoding="utf-8-sig", errors="replace")
+        except OSError as exc:
+            raise SubtitleConversionError(f"failed to read subtitle: {exc}") from exc
+        if not _ass_document_info(same_format_text)[0]:
+            return input_path
+        output_path = None
 
     output = Path(output_path) if output_path else unique_path(
         bounded_path(
@@ -79,6 +90,20 @@ def convert_subtitle_file(
         text = input_path.read_text(encoding="utf-8-sig", errors="replace")
     except OSError as exc:
         raise SubtitleConversionError(f"failed to read subtitle: {exc}") from exc
+
+    is_ass, empty_ass = _ass_document_info(text)
+    if is_ass:
+        if empty_ass:
+            _write_subtitle(output, [], target)
+            return output
+        converted = _convert_with_ffmpeg(input_path, output, target, input_format="ass")
+        # Keep native ASS styles/override tags on ASS output. For plain text
+        # targets, apply the same cue repair and duration rules as VTT/TTML.
+        if auto_fix and target in {"srt", "vtt"}:
+            cues = _parse_text_subtitle(converted.read_text(encoding="utf-8-sig"), f".{target}")
+            cues = _fit_cues_to_duration(_fix_cues(cues), duration)
+            _write_subtitle(converted, cues, target)
+        return converted
 
     cues = _parse_text_subtitle(text, input_path.suffix.lower())
     if cues:
@@ -103,6 +128,50 @@ def convert_subtitle_file(
         return output
 
     return _convert_with_ffmpeg(input_path, output, target)
+
+
+def _ass_document_info(text: str) -> tuple[bool, bool]:
+    """Recognize an ASS/SSA document, not header-like text inside a cue.
+
+    A real document starts with Script Info (possibly after BOM, whitespace or
+    semicolon comments) and declares a ScriptType or an Events field layout.
+    Only an Events layout without Dialogue records proves an empty subtitle;
+    malformed records must reach FFmpeg instead of being discarded as empty.
+    """
+    lines = iter(text.lstrip("\ufeff").splitlines())
+    first = next((line.strip() for line in lines if line.strip() and not line.lstrip().startswith(";")), "")
+    if first.lower() != "[script info]":
+        return False, False
+    section = "script info"
+    script_type = False
+    event_format = False
+    has_dialogue = False
+    invalid_event = False
+    for raw_line in lines:
+        line = raw_line.strip()
+        if not line or line.startswith(";"):
+            continue
+        # A header-like WebVTT cue identifier may be followed by dialogue
+        # mentioning ScriptType. A text-cue timestamp is not ASS structure.
+        if re.match(r"(?:\d+:)?\d{2}:\d{2}[.,]\d+\s*-->", line):
+            return False, False
+        if line.startswith("[") and line.endswith("]"):
+            section = line[1:-1].strip().lower()
+            continue
+        name, separator, value = line.partition(":")
+        name = name.strip().lower()
+        if section == "script info" and name == "scripttype":
+            script_type = value.strip().lower() in {"v4.00", "v4.00+"}
+        elif section == "events":
+            if name == "format" and separator:
+                fields = [field.strip().lower() for field in value.split(",")]
+                event_format = {"start", "end", "text"}.issubset(fields) and fields[-1] == "text"
+                invalid_event |= not event_format
+            elif name == "dialogue":
+                has_dialogue = True
+            elif name != "comment" or not separator:
+                invalid_event = True
+    return script_type or event_format, event_format and not has_dialogue and not invalid_event
 
 
 def _normalize_output_format(value: str) -> str:
@@ -967,11 +1036,16 @@ def _time_parts(seconds: float) -> tuple[int, int, int, int]:
     return hours, minutes, secs, millis
 
 
-def _convert_with_ffmpeg(input_path: Path, output_path: Path, output_format: str) -> Path:
+def _convert_with_ffmpeg(
+    input_path: Path, output_path: Path, output_format: str, *, input_format: str | None = None,
+) -> Path:
     executable = shutil.which("ffmpeg")
     if not executable:
         raise SubtitleConversionError("subtitle conversion failed and ffmpeg was not found")
-    args = [executable, "-hide_banner", "-y", "-i", str(input_path), str(output_path)]
+    args = [executable, "-hide_banner", "-y"]
+    if input_format is not None:
+        args.extend(["-f", input_format])
+    args.extend(["-i", str(input_path), str(output_path)])
     completed = managed_run(args, capture_output=True)
     if completed.returncode != 0 or not output_path.exists() or output_path.stat().st_size == 0:
         error = completed.stderr.decode("utf-8", errors="replace").strip()

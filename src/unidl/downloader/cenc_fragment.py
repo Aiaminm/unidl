@@ -5,20 +5,25 @@ import os
 import shutil
 import tempfile
 import threading
+from bisect import bisect_right
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from functools import lru_cache
+from operator import itemgetter
 from pathlib import Path
+from time import monotonic
 
 CTR_SCHEMES = {b"cenc", b"cens"}
 CBC_SCHEMES = {b"cbcs", b"cbc1"}
 PIFF_SAMPLE_ENCRYPTION_UUID = bytes.fromhex("a2394f525a9b4f14a2446c427c648df4")
 _AES_ECB_THREAD_LOCAL = threading.local()
+_MDAT_RANGE_START = itemgetter(0)
 
 # A whole-file CENC pass should never create a second resident copy of the
 # media. Keep the original bytearray path for small fragments, but map larger
 # files and decrypt directly into a disk-backed output mapping.
 MMAP_DECRYPT_THRESHOLD = 256 * 1024 * 1024
+CencProgressCallback = Callable[[int, int], None]
 
 
 @dataclass(frozen=True, slots=True)
@@ -116,6 +121,7 @@ def decrypt_cenc_fragment(
     default_constant_iv: bytes | None = None,
     data_callback: Callable[[bytearray], None] | None = None,
     init_metadata: CencInitMetadata | None = None,
+    progress_callback: CencProgressCallback | None = None,
 ) -> Path | None:
     """Decrypt a fragmented MP4 media fragment that carries CENC info in sgpd/senc.
 
@@ -141,6 +147,7 @@ def decrypt_cenc_fragment(
             default_constant_iv,
             data_callback,
             init_metadata,
+            progress_callback,
         )
     data = bytearray(source.read_bytes())
     return _decrypt_cenc_fragment_buffer(
@@ -153,6 +160,7 @@ def decrypt_cenc_fragment(
         default_constant_iv,
         data_callback,
         init_metadata,
+        progress_callback=progress_callback,
     )
 
 
@@ -165,6 +173,7 @@ def _decrypt_cenc_fragment_mmap(
     default_constant_iv: bytes | None,
     data_callback: Callable[[bytearray], None] | None,
     init_metadata: CencInitMetadata | None,
+    progress_callback: CencProgressCallback | None = None,
 ) -> Path | None:
     """Decrypt a large fragmented MP4 without materialising it in RAM.
 
@@ -224,6 +233,7 @@ def _decrypt_cenc_fragment_mmap(
                     init_metadata,
                     write_output=False,
                     release_callback=release_pages_through,
+                    progress_callback=progress_callback,
                 )
                 if result is None:
                     return None
@@ -256,6 +266,7 @@ def _decrypt_cenc_fragment_buffer(
     *,
     write_output: bool = True,
     release_callback: Callable[[int], None] | None = None,
+    progress_callback: CencProgressCallback | None = None,
 ) -> Path | None:
     has_fragment_markers = _has_fragment_cenc_markers(data)
     default_groups_by_track: dict[int, _SeigGroup] = {}
@@ -297,6 +308,7 @@ def _decrypt_cenc_fragment_buffer(
         default_groups_by_track,
         sample_entry_encrypted_by_track,
         release_callback,
+        progress_callback,
     )
     if not result.changed and not result.handled_clear:
         return None
@@ -329,6 +341,7 @@ def _decrypt_fragment_data(
     default_groups_by_track: dict[int, _SeigGroup] | None = None,
     sample_entry_encrypted_by_track: dict[int, tuple[bool, ...]] | None = None,
     release_callback: Callable[[int], None] | None = None,
+    progress_callback: CencProgressCallback | None = None,
 ) -> _FragmentDecryptResult:
     mdat_ranges = _top_level_mdat_payload_ranges(data)
     if not mdat_ranges:
@@ -337,6 +350,10 @@ def _decrypt_fragment_data(
     handled_clear = False
     handled_clear = False
     moofs = [box for box in _mp4_boxes(data) if box[2] == b"moof"]
+    last_progress = 0.0
+    if progress_callback and moofs:
+        progress_callback(0, len(moofs))
+        last_progress = monotonic()
     for moof_index, (moof_position, moof_size, _box_type, moof_header) in enumerate(moofs):
         moof_start = moof_position
         moof_end = moof_position + moof_size
@@ -361,6 +378,11 @@ def _decrypt_fragment_data(
         if release_callback:
             next_moof = moofs[moof_index + 1][0] if moof_index + 1 < len(moofs) else len(data)
             release_callback(next_moof)
+        if progress_callback:
+            now = monotonic()
+            if moof_index + 1 == len(moofs) or now - last_progress >= 0.5:
+                progress_callback(moof_index + 1, len(moofs))
+                last_progress = now
     return _FragmentDecryptResult(changed=changed, handled_clear=handled_clear)
 
 
@@ -1184,7 +1206,12 @@ def _first_mdat_payload_start(ranges: list[tuple[int, int]]) -> int:
 
 
 def _range_inside_any(start: int, end: int, ranges: list[tuple[int, int]]) -> bool:
-    return any(start >= range_start and end <= range_end for range_start, range_end in ranges)
+    # Top-level mdat payloads are ordered and disjoint, as emitted by
+    # _mp4_boxes. Locate the only possible containing payload without scanning
+    # every earlier fragment for every audio/video sample. Keep the end check:
+    # a sample spanning two payloads or a box header must still be rejected.
+    index = bisect_right(ranges, start, key=_MDAT_RANGE_START) - 1
+    return index >= 0 and end <= ranges[index][1]
 
 
 def _mp4_boxes(data: bytes | bytearray, start: int = 0, end: int | None = None):
