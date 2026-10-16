@@ -26,7 +26,7 @@ import time
 import uuid
 from collections import deque
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlsplit
@@ -66,11 +66,13 @@ from ..core.partner import (
 from ..core.playback import LiveWindow, Playback, normalize_live_record_limit
 from ..core.service import Service
 from ..core.title_delay import parse_title_delay, sample_title_delay
+from ..core.titles import Title
 from ..core.vault import normalize_hex, split_pair
 from . import logline
 from .askhost import LOG_LIMIT
 from .asks import BACK
 from .audio import AudioPreview
+from .job_details import JobDetails
 from .logline import GUTTER_WIDTH, LogLine
 
 if TYPE_CHECKING:
@@ -504,6 +506,7 @@ _OVERLAY_WAIT = 30.0
 #: when its job starts, because the queue is fed one playback at a time by a
 #: generator and nothing knows the next title until it arrives.
 RUNNING = "running"
+QUEUED = "queued"
 DONE = "done"
 FAILED = "failed"
 SKIPPED = "skipped"
@@ -525,6 +528,13 @@ class Job:
     playback: Playback | None = None
     #: how many times it has been run, including the first
     attempts: int = 1
+    #: Small display-only history survives releasing a successful Playback.
+    details: JobDetails = JobDetails()
+    identity: tuple | None = None
+    started_at: float | None = None
+    finished_at: float | None = None
+    download_started_at: float | None = None
+    download_finished_at: float | None = None
 
     @property
     def retryable(self) -> bool:
@@ -580,6 +590,9 @@ class TextualPresenter:
         controller = self._controller
         if controller.aborted:
             raise Quit()
+        delivery_ask = getattr(ask, "scope", None) == SCOPE_DELIVERY
+        if delivery_ask and controller.cancel_requested:
+            raise Back()
 
         if isinstance(ask, SettingsAsk):
             controller.app.call_from_thread(controller.app.action_global_settings)
@@ -602,6 +615,9 @@ class TextualPresenter:
         while not event.wait(_ANSWER_POLL):
             if controller.aborted:
                 raise Quit()
+            if delivery_ask and controller.cancel_requested:
+                controller._on_ui(controller._cancel_delivery_asks)
+                raise Back()
         controller.awaiting_answer = False
 
         if box.get("quit") or controller.aborted:
@@ -618,7 +634,12 @@ class TextualPresenter:
         if isinstance(ask, Pick) and ask.multi and ask.scope != SCOPE_DELIVERY:
             wanted = _selections(ask, value)
             if len(wanted) > 1:
-                controller.hint_batch(len(wanted))
+                controller.hint_batch(len(wanted), choices=[
+                    choice for choice in ask.choices
+                    if any(choice.value is item or (
+                        isinstance(item, (str, int)) and choice.value == item
+                    ) for item in wanted)
+                ])
         return value
 
 
@@ -655,6 +676,7 @@ class SessionController:
         self.delivery: DownloadScreen | None = None
 
         self.job_running = False
+        self._transfer_active = False
         #: True while an automatic batch is waiting before its next title.  It
         #: shares the delivery pause/cancel controls but has no active downloader
         #: job or track workers yet.
@@ -699,6 +721,8 @@ class SessionController:
 
         #: one entry per playback the flow has handed over, in order
         self.jobs: list[Job] = []
+        # Unstarted rows are presentation only, not jobs already authorized.
+        self.pending_jobs: list[Job] = []
         #: ``(save name, command)`` for every command-only job of the current run,
         #: so the card can show a whole batch rather than only its last title.
         #: Cleared with the queue, because that is what a run is.
@@ -1157,7 +1181,7 @@ class SessionController:
         self._open_queue(total)
         self._confirm_batch()
 
-    def hint_batch(self, total: int) -> None:
+    def hint_batch(self, total: int, *, choices: list[Choice] | None = None) -> None:
         """A multi-select answered with ``total`` things, so infer a batch.
 
         Same effect as :meth:`begin_batch`, from the other direction: the driver
@@ -1165,6 +1189,12 @@ class SessionController:
         coming.
         """
         self._open_queue(total)
+        if choices is not None and len(choices) == len(self.pending_jobs):
+            for job, choice in zip(self.pending_jobs, choices, strict=True):
+                job.name = choice.label
+                if isinstance(choice.value, Title):
+                    job.identity = self._title_identity(choice.value)
+            self.render_queue()
         self._confirm_batch()
 
     def _open_queue(self, total: int) -> None:
@@ -1172,6 +1202,7 @@ class SessionController:
         if self.queue_complete:
             # the last batch is over and has been reported: start clean
             self.jobs = []
+            self.pending_jobs = []
             self.clear_cancel()  # a new batch is not born cancelled
         # Otherwise this pick happened *inside* a run - a page of episodes after
         # an earlier page, seasons then their episodes - so the rows already on
@@ -1181,6 +1212,11 @@ class SessionController:
         self.batch_declined = False
         done = len([job for job in self.jobs if job.state in FINISHED_STATES])
         self.batch_total = done + wanted
+        if len(self.pending_jobs) != wanted:
+            self.pending_jobs = [
+                Job(tr("job.queued_title", number=done + index + 1), state=QUEUED, attempts=0)
+                for index in range(wanted)
+            ]
         self.render_queue()
         if wanted > 1:
             self.post_log(f"{wanted} titles queued")
@@ -1292,8 +1328,17 @@ class SessionController:
         self.cancel_event.set()
         self.pause_event.clear()
         self.batch_cancelled = True
+        # Do not authorize/emit the rest of a cancelled batch just to fill its
+        # counter. Once this job finishes, delivery can return to its parent.
+        self.batch_total = None
+        self._settle_pending(CANCELLED)
         self._shutdown_active_download()
-        self.post_log("stopping at the next segment", "warning")
+        self.post_log(
+            tr("delivery.cancel.transfer") if getattr(self, "_transfer_active", False)
+            else tr("delivery.cancel.preparing"),
+            "warning",
+        )
+        self._on_ui(self._cancel_delivery_asks)
         if self.job_running or self._title_delay_active:
             # only while there is something to stop: a cancellation asked for
             # between two titles must also wake the interruptible title delay.
@@ -1301,6 +1346,12 @@ class SessionController:
         if self.delivery is not None:
             self._on_ui(self.delivery.refresh_keys)
         return True
+
+    def _cancel_delivery_asks(self) -> None:
+        """Release only download questions, never a service/login prompt."""
+        for host in list(self.hosts):
+            if getattr(host, "_ask_scope", None) == SCOPE_DELIVERY and getattr(host, "waiting", False):
+                host._resolve(BACK)
 
     def request_skip(self) -> bool:
         """Stop the title in flight and carry on with the rest of the batch.
@@ -1316,6 +1367,7 @@ class SessionController:
         self.pause_event.clear()
         self._skip_one = True
         self._shutdown_active_download()
+        self._on_ui(self._cancel_delivery_asks)
         self.post_log("skipping this one; the rest of the queue carries on", "warning")
         self.post_status(tr("delivery.status.skipping"))
         if self.delivery is not None:
@@ -1341,12 +1393,27 @@ class SessionController:
             self.post_log(f"could not release playback transport: {exc}", "warning")
 
     def _start_job(self, playback: Playback) -> Job:
-        job = Job(name=playback.save_name, state=RUNNING, playback=playback)
+        identity = self._title_identity(getattr(playback, "title", None))
+        pending = self.pending_jobs
+        job = next((item for item in pending if item.state == QUEUED and (
+            (identity is not None and item.identity == identity)
+            or (item.details.save_name and item.details.save_name == playback.save_name)
+        )), None)
+        if job is None:
+            job = next((item for item in pending if item.state == QUEUED), None)
+        if job is not None:
+            pending.remove(job)
+            job.name, job.state, job.playback, job.attempts = playback.save_name, RUNNING, playback, 1
+        else:
+            job = Job(name=playback.save_name, state=RUNNING, playback=playback,
+                      details=JobDetails(save_name=playback.save_name), identity=identity)
         self.jobs.append(job)
+        self._snapshot_job(playback)
         self.render_queue()
         return job
 
     def _finish_job(self, job: Job, state: str, note: str = "") -> None:
+        job.finished_at = time.monotonic() if job.started_at is not None else None
         job.state = state
         job.note = note
         if state not in (FAILED, CANCELLED):
@@ -1362,6 +1429,53 @@ class SessionController:
         # offered on whichever screen you are on. Nothing else was going to redraw
         # the bar, so the key existed and never appeared.
         self._on_ui(self._refresh_keys_all)
+
+    @staticmethod
+    def _title_identity(title: Title | None) -> tuple | None:
+        return (str(title.id), title.season, title.episode) if title is not None else None
+
+    def queue_jobs(self) -> list[Job]:
+        """Visible rows, without changing authorization/retry queue semantics."""
+        return [*self.jobs, *self.pending_jobs]
+
+    def _settle_pending(self, state: str) -> None:
+        for job in getattr(self, "pending_jobs", ()):
+            if job.state == QUEUED:
+                job.state = state
+                job.note = tr("job.not_started")
+        self.render_queue()
+
+    def _seed_import_jobs(self, document: exports.Document) -> None:
+        self.pending_jobs = [
+            Job(entry.label(), state=QUEUED, attempts=0,
+                details=JobDetails.from_entry(entry),
+                identity=self._title_identity(entry.title) if entry.title is not None else None)
+            for entry in document.entries
+        ]
+
+    def _snapshot_job(
+        self, playback: Playback, tracks: TrackSet | None = None, *,
+        outputs: tuple[str, ...] | None = None,
+    ) -> None:
+        job = next((item for item in reversed(self.jobs) if item.playback is playback), None)
+        if job is None:
+            return
+        try:
+            key_ids = getattr(getattr(self.engine, "downloader", None), "key_ids", lambda _streams: ())
+            rows = tuple(stream.format_line() for stream in tracks.selected) if tracks is not None else None
+            kids = []
+            if tracks is not None:
+                for index, stream in enumerate(tracks.selected, start=1):
+                    found = key_ids([stream])
+                    if found:
+                        kids.append(f"{stream.media_type} {index}: {', '.join(found)}")
+            job.details = JobDetails.from_playback(
+                playback, previous=job.details, tracks=rows, track_kids=tuple(kids), outputs=outputs,
+            )
+        except Exception:
+            # Optional inspection must not fail or strand a media task when a
+            # third-party track formatter is malformed. Keep the last snapshot.
+            return
 
     def _refresh_keys_all(self) -> None:
         for host in list(self.hosts):
@@ -1399,7 +1513,7 @@ class SessionController:
 
     def _render_queue_ui(self) -> None:
         if self.delivery is not None:
-            self.delivery.render_queue(self.jobs, self.batch_total)
+            self.delivery.render_queue(self.queue_jobs(), self.batch_total)
 
     # ------------------------------------------------------------------- errors
     @property
@@ -1467,6 +1581,10 @@ class SessionController:
         by clearing the status - it is transient by design, and what a step actually
         produced is logged by whoever produced it.
         """
+        if getattr(ask, "scope", SCOPE_FLOW) == SCOPE_DELIVERY and self.cancel_requested:
+            box["value"] = BACK
+            event.set()
+            return
         self._status_all("")
         # Being asked something means the flow is not producing playbacks any
         # more, which is the queue's other way of knowing it is idle when the
@@ -1494,6 +1612,10 @@ class SessionController:
         # on the way out would ask something nobody is there to answer.
         if self.aborted:
             host = None
+        if getattr(ask, "scope", SCOPE_FLOW) == SCOPE_DELIVERY and self.cancel_requested:
+            box["value"] = BACK
+            event.set()
+            return
         if host is None:
             box["quit"] = True
             event.set()
@@ -1852,6 +1974,7 @@ class SessionController:
             # the first completed entry as the end of the run and ``Back``
             # unwinds ``_replay`` before the remaining entries are delivered.
             self.batch_total = len(document.entries)
+            self._seed_import_jobs(document)
             flow = self._replay(ctx, document)
         elif target:
             flow = self._deep_link(ctx, self.service.open_url, str(target))
@@ -1884,6 +2007,7 @@ class SessionController:
             self.engine.live_key_input = None
 
         self.finished = True
+        self._settle_pending(CANCELLED if self.batch_cancelled else SKIPPED)
         # nothing more is coming, so a batch that was abandoned part-way stops
         # claiming to be in progress - and neither does the status line, for the
         # flow that died between two jobs with one still on it
@@ -2055,6 +2179,7 @@ class SessionController:
         new_run = self.run_boundary and self.queue_complete
         if new_run:
             self.jobs = []
+            self.pending_jobs = []
             self.commands = []
             self.command_audio_metadata = []
             self.command_subtitle_metadata = []
@@ -2137,11 +2262,38 @@ class SessionController:
         exactly the path it did the first time rather than a second copy of it.
         """
         self.job_running = True
+        self._transfer_active = False
+        job.started_at = time.monotonic()
+        job.finished_at = job.download_started_at = job.download_finished_at = None
+        # A retry must not report old files as the result of its new attempt.
+        keep_export = job.details.from_export and not job.details.confirmed
+        job.details = replace(
+            job.details, outputs=(), confirmed=False,
+            tracks=job.details.tracks if keep_export else (),
+            track_kids=job.details.track_kids if keep_export else (),
+        )
+        self._snapshot_job(playback)
         self.clear_pause()
+        self.clear_errors()
+        self.post_frame([])
         state, note = FAILED, "stopped unexpectedly"
         try:
             state, note = self._process(playback, presenter, ctx)
+            if self.cancel_requested and state in (FAILED, SKIPPED):
+                state, note = CANCELLED, "cancelled"
+        except (Back, Quit):
+            raise
+        except Exception as exc:
+            # One malformed manifest, failed key probe or provider hook must not
+            # tear down a batch's generator and strand its remaining titles.
+            if self.cancel_requested:
+                state, note = CANCELLED, "cancelled"
+            else:
+                note = f"{type(exc).__name__}: {exc}"
+                self.post_error(f"Could not process {playback.save_name}", note)
         finally:
+            self._transfer_active = False
+            self._snapshot_job(playback)
             self._release_playback(playback)
             self.job_running = False
             self._recording_active = False
@@ -2159,6 +2311,8 @@ class SessionController:
                 self._skip_one = False
                 self.clear_cancel()
             self._finish_job(job, state, note)
+            if state == CANCELLED:
+                self.post_log(tr("delivery.cancelled_title", name=job.name), "warning")
             self._on_ui(self._after_job)
         return state
 
@@ -2323,6 +2477,8 @@ class SessionController:
                     raise
                 tracks = self.engine.parse_tracks(playback, self.settings)
         except Exception as exc:
+            if self.cancel_requested:
+                return CANCELLED, "cancelled"
             self.post_error(
                 "Could not read the manifest",
                 str(exc),
@@ -2359,7 +2515,6 @@ class SessionController:
         if self.cancel_requested:
             # asked to stop while the manifest was being read: nothing below this
             # is worth asking about, least of all which tracks to fetch
-            self.post_log("cancelled", "warning")
             return CANCELLED, "cancelled"
 
         # Asked before the licence, not after it. Two of the three answers need a
@@ -2425,15 +2580,17 @@ class SessionController:
             try:
                 self.post_status(tr("delivery.status.resolving_keys"))
                 self.engine.resolve_keys(playback, self.service, tracks, self.settings)
+                self._require_content_keys(playback, tracks)
             except Exception as exc:
-                # not fatal: the download can still be attempted, and the report
-                # below will show that no key was obtained
+                if self.cancel_requested:
+                    return CANCELLED, "cancelled"
                 self.post_error(
                     "Could not get the content key",
                     str(exc),
                     "Check the CDM on the main screen. An L3 device cannot open some "
                     "streams, and an expired session cannot request a licence.",
                 )
+                return FAILED, "key acquisition failed"
 
         def report_keys() -> None:
             for key in playback.display_keys:
@@ -2466,7 +2623,6 @@ class SessionController:
             self.post_field("key", "deferred until final track selection", "muted")
 
         if self.cancel_requested:
-            self.post_log("cancelled", "warning")
             return CANCELLED, "cancelled"
 
         # Only now settle the tracks that UniDL will download/export. This
@@ -2536,6 +2692,8 @@ class SessionController:
                 "'download the file' to choose tracks yourself."
             )
 
+        if self.cancel_requested:
+            return CANCELLED, "cancelled"
         self._report_hybrid_choice(playback, tracks)
 
         if not tracks.selected:
@@ -2545,7 +2703,10 @@ class SessionController:
         # KIDs shown by Core and the delivery screen come from the selected
         # rendition/init data, never from a master-level session declaration.
         hydrate_selected_track_kids()
+        self._snapshot_job(playback, tracks)
 
+        if self.cancel_requested:
+            return CANCELLED, "cancelled"
         if defer_license:
             try:
                 self.post_status(tr("delivery.status.resolving_selected_keys"))
@@ -2557,18 +2718,22 @@ class SessionController:
                     self.settings,
                     license_tracks=selected_inventory,
                 )
+                self._require_content_keys(playback, selected_inventory)
             except Exception as exc:
-                # Keep the existing non-fatal key behavior: the native downloader
-                # still receives the plan and its result explains a missing key.
+                if self.cancel_requested:
+                    return CANCELLED, "cancelled"
                 self.post_error(
                     "Could not get the content key",
                     str(exc),
                     "Check the CDM on the main screen. An L3 device cannot open some "
                     "streams, and an expired session cannot request a licence.",
                 )
+                return FAILED, "key acquisition failed"
             report_keys()
             self.post_status("")
 
+        if self.cancel_requested:
+            return CANCELLED, "cancelled"
         if actual := _actual_video_line(tracks):
             self.post_field("actual", actual, "ok")
 
@@ -2624,13 +2789,17 @@ class SessionController:
                                 self.settings,
                                 license_tracks=selected_inventory,
                             )
+                            self._require_content_keys(playback, selected_inventory)
                         except Exception as exc:
+                            if self.cancel_requested:
+                                return CANCELLED, "cancelled"
                             self.post_error(
                                 "Could not get the content key",
                                 str(exc),
                                 "Check the CDM on the main screen. An L3 device cannot open some "
                                 "streams, and an expired session cannot request a licence.",
                             )
+                            return FAILED, "key acquisition failed"
                         report_keys()
                         self.post_status("")
                     if actual := _actual_video_line(tracks):
@@ -2800,6 +2969,12 @@ class SessionController:
         self.post_status(tr("delivery.status.downloading_name", name=playback.save_name))
         if self.delivery is not None:
             self._on_ui(self.delivery.refresh_keys)
+        if self.cancel_requested:
+            return CANCELLED, "cancelled"
+        self._transfer_active = True
+        job = next((item for item in reversed(self.jobs) if item.playback is playback), None)
+        if job is not None:
+            job.download_started_at = time.monotonic()
         try:
             result = self.engine.run(
                 playback,
@@ -2811,6 +2986,9 @@ class SessionController:
                 stop_recording=self.stop_recording_event,
             )
         finally:
+            self._transfer_active = False
+            if job is not None:
+                job.download_finished_at = time.monotonic()
             was_live = playback.is_live
             self._set_live_frame_mode(False)
             if was_live:
@@ -2819,24 +2997,33 @@ class SessionController:
                 # picture over the finished result.
                 self.post_frame([])
         self.post_status("")
+        self._snapshot_job(playback, tracks, outputs=tuple(str(path) for path in getattr(result, "artifacts", ())))
         if result.cancelled:
             # not a failure: the user asked for this, so it is not coloured or
             # counted as something that went wrong
-            self.post_log("cancelled", "warning")
             self._notify(f"Stopped {playback.save_name}")
             return CANCELLED, "cancelled"
         if result.ok:
             completed = tuple(dict.fromkeys(result.artifacts)) or (result.output_dir,)
             for path in completed:
                 self.post_log(f"done -> {path}", "ok")
-            if playback.attachments and attachments_enabled:
-                attachment_paths = self.engine.download_attachments(
-                    playback,
-                    self.settings,
-                    service=self.service.ID,
-                )
+            if playback.attachments and attachments_enabled and self.settings.get("download_attachments", True):
+                try:
+                    attachment_paths = self.engine.download_attachments(
+                        playback,
+                        self.settings,
+                        service=self.service.ID,
+                    )
+                except Exception as exc:
+                    self.post_log(f"could not download attachments: {exc}", "warning")
+                    attachment_paths = ()
                 for path in attachment_paths:
                     self.post_log(f"attachment -> {path}", "ok")
+                if attachment_paths:
+                    self._snapshot_job(playback, tracks, outputs=tuple(
+                        dict.fromkeys((*[str(path) for path in result.artifacts],
+                                       *[str(path) for path in attachment_paths]))
+                    ))
             self._notify(f"Downloaded {playback.save_name}")
             return DONE, ""
 
@@ -3144,11 +3331,13 @@ class SessionController:
     async def _open_delivery(self, playback: Playback, tracks: TrackSet) -> None:
         """Bring UniDL's screen up, just before it has something to show."""
         screen = await self.delivery_screen()
+        self._snapshot_job(playback, tracks)
         screen.describe(playback, tracks)
 
     async def _refresh_delivery(self, playback: Playback, tracks: TrackSet) -> None:
         """Refresh the delivery card after the selected-track probes finish."""
         screen = await self.delivery_screen()
+        self._snapshot_job(playback, tracks)
         screen.describe(playback, tracks, reset_clock=False)
 
     async def _present_card(self, panel: Panel) -> None:
@@ -3276,9 +3465,9 @@ class SessionController:
                 host.clear_panel()
             except Exception:
                 pass
-        # Do not collapse the navigation stack here.  The card is one page in the
-        # flow; the caller's next Back (or the flow's next ask) decides which
-        # immediate parent to reveal.
+        # Do not pop the flow page here or in the Back handler. The next ask
+        # restores its input/picker on that page, or host_for closes it before
+        # mounting the service root. One owner avoids racing widget unmount.
         self._leave_when_read = False
         return True
 
@@ -3301,6 +3490,18 @@ class SessionController:
             if "unexpected keyword argument 'preserve_partial'" not in str(exc):
                 raise
             return self.engine.select_tracks(playback, self.settings, tracks)
+
+    @staticmethod
+    def _require_content_keys(playback: Playback, inventory: TrackSet) -> None:
+        """An empty failed licence is not a reason to wait for another picker."""
+        drm = playback.drm
+        if (
+            drm is not None and drm.needs_license
+            and str(drm.system or "widevine").lower() in {"widevine", "playready"}
+            and any(stream.encrypted for stream in inventory.streams)
+            and not playback.keys and not playback.display_keys
+        ):
+            raise RuntimeError("The licence returned no usable content keys.")
 
     def _ask_tracks(
         self,

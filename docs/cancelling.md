@@ -19,6 +19,53 @@ Pause waits at the next segment or live refresh. Back, the first Quit, and skip
 still cancel. The old Stop control cancelled immediately; that is what Pause
 replaced.
 
+## Failed titles in a batch
+
+A manifest, licence or selected-track preparation failure finishes that title
+as failed and preserves its queue row for retry. The remaining titles continue;
+a failed licence (including an empty Widevine/PlayReady key response) does not
+leave a hidden track-selection question waiting for an answer. Clear media and
+ordinary HLS AES-128 do not require content-key pairs.
+
+After the final title, the queue leaves its busy state even when that title
+failed. Back returns normally; it does not try to stop a nonexistent transfer.
+Cancelling during preparation also dismisses a pending download/track question
+and stops the unstarted remainder of the batch. Service and login prompts are
+not dismissed by a download cancellation. An in-flight synchronous provider
+request may still need its configured network timeout to return; no message
+claims it is waiting for a media segment when no transfer is active.
+
+## Inspecting batch titles
+
+Click any title in the download queue to open its details, including completed,
+running, failed and queued titles. The popup does not pause a transfer, change
+track selection or request a manifest, licence or media segment. Use the compact
+Previous/Next controls or Left/Right to inspect adjacent titles. Esc, Ctrl+B or
+the close mark closes only the popup; it does not stop the download.
+
+Completed rows retain the actual reported output paths, confirmed selected
+tracks, per-track KIDs, available keys, metadata counts and timing for the latest
+attempt. Total elapsed time includes preparation and manual selection; download
+and processing time covers the native transfer/decryption/mux run, including
+pauses. A failed or cancelled row retains the information collected so far.
+Its explicit **Retry** button is enabled only when no job is active.
+Clicking a row itself no longer starts a retry.
+
+An ordinary unstarted title says **Queued**: UniDL does not pre-authorize it
+just to populate the popup. When available, its label comes from the title
+selection; otherwise a numbered placeholder is used. Native batch imports can
+show the saved title, manifest references, exported track inventory, keys and
+metadata before downloading. The exported inventory is labelled separately
+from the current confirmed selection; saved information is not a promise that
+an expiring URL or key is still valid. Pending rows never count as already
+started tasks and do not enter the retry queue.
+
+These details are lightweight, in-memory session history, not another export or
+debug log. No parsed segment lists, licence payloads, cookies or account tokens
+are retained for the popup. Content keys are deliberately visible: treat them
+and signed manifest links as sensitive, and redact them before sharing a
+screenshot. Starting a new batch clears the previous batch's history.
+
 ## Delay between batch titles
 
 The global **Download behavior → Delay between titles** setting is a scheduler

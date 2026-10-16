@@ -30,6 +30,12 @@ Three things to read alongside this:
 
 ## Start from the template
 
+For an installed build, find its real service location under **Settings →
+Files & naming → Advanced paths → Service directory**. Click the row
+or press Enter to open it; do not assume the command uses a nearby source
+checkout. After copying a package there, register it under **Settings →
+Services → Register a service** and restart UniDL.
+
     cp -r src/unidl/services/example src/unidl/services/mysvc
 
 Then edit `ID`, `NAME`, `TAG`, and delete the hooks you do not implement. A

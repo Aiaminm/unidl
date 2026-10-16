@@ -33,11 +33,13 @@ from .askhost import AskHost
 from .audio import AudioPreview, AudioPreviewWidget
 from .bidi import visual_text
 from .chrome import Chrome, ChromeButton, StatusChip
+from .job_details import JobDetailsScreen
 from .logline import safe_terminal_text
 from .session import (
     CANCELLED,
     DONE,
     FAILED,
+    QUEUED,
     RUNNING,
     SKIPPED,
     _track_highlights,
@@ -50,6 +52,7 @@ if TYPE_CHECKING:
 #: state -> (glyph, palette role). A glyph as well as a colour, so the states are
 #: still distinguishable where colour is not.
 STATE_MARK = {
+    QUEUED: ("○", "dim"),
     RUNNING: ("▸", "accent"),
     DONE: ("✓", "ok"),
     FAILED: ("✗", "error"),
@@ -137,7 +140,7 @@ def _styled_progress_text(
 
 
 class QueueRow(Static):
-    """One queue row, which a failed one can be clicked to run again.
+    """One queue row: every status opens its own read-only history.
 
     Clickable rather than focusable: the queue is a report, and giving it focus
     would put a second cursor on a screen that already has one in the log and one
@@ -148,14 +151,13 @@ class QueueRow(Static):
         super().__init__(line, classes="queue-row" + (" retryable" if job.retryable else ""))
         self.job = job
         self.index = index
+        self._queue_line = line
 
     def on_click(self, event) -> None:
-        if not self.job.retryable:
-            return
         event.stop()
-        retry = getattr(self.screen, "retry_job", None)
-        if callable(retry):
-            retry(self.job)
+        inspect = getattr(self.screen, "show_job_details", None)
+        if callable(inspect):
+            inspect(self.job)
 
 #: How much of a shortened name is worth keeping at the front. The rest of the
 #: room goes to the tail, because that is where the release half lives - the
@@ -387,7 +389,8 @@ class DownloadScreen(AskHost):
         if attachments_found:
             attachments_found.first(StatusChip).display = False
         self.refresh_keys()
-        self.render_queue(self.controller.jobs, self.controller.batch_total)
+        queue = getattr(self.controller, "queue_jobs", None)
+        self.render_queue(queue() if callable(queue) else self.controller.jobs, self.controller.batch_total)
         # a screen that appears while something is already downloading shows it
         version, rows = self.controller.frame_snapshot()
         self.show_frame(rows)
@@ -526,6 +529,9 @@ class DownloadScreen(AskHost):
         self._frame_rows = 0
 
     # ------------------------------------------------------------------- queue
+    def show_job_details(self, job) -> None:
+        self.app.push_screen(JobDetailsScreen(self.controller, job))
+
     def render_queue(self, jobs: list, total: int | None) -> None:
         """Show where a batch has got to.
 
@@ -567,7 +573,12 @@ class DownloadScreen(AskHost):
         summary.first(Static).update(head)
 
         target = listing.first(VerticalScroll)
-        target.remove_children()
+        existing = list(target.query(QueueRow))
+        reuse = len(existing) == len(jobs) and all(
+            row.job is job for row, job in zip(existing, jobs, strict=True)
+        )
+        if not reuse:
+            target.remove_children()
         rows = []
         for index, job in enumerate(jobs, start=1):
             mark, role = STATE_MARK[job.state]
@@ -580,12 +591,25 @@ class DownloadScreen(AskHost):
             )
             if job.note:
                 line.append(f"  {visual_text(job.note)}", style=palette.dim)
-            if job.retryable:
-                line.append(f"   {tr('delivery.retry_hint')}", style=palette.accent)
-            rows.append(QueueRow(line, job=job, index=index))
+            if reuse:
+                row = existing[index - 1]
+                if row._queue_line != line:
+                    row._queue_line = line
+                    row.update(line)
+                row.set_class(bool(job.retryable), "retryable")
+            else:
+                row = QueueRow(line, job=job, index=index)
+                row.tooltip = tr("job.open_hint")
+            rows.append(row)
         if rows:
-            target.mount_all(rows)
-            rows[-1].scroll_visible(animate=False)
+            if not reuse:
+                target.mount_all(rows)
+            active = next((row for row in rows if row.job.state == RUNNING), None)
+            anchor = active or next((row for row in reversed(rows) if row.job.state != QUEUED), rows[0])
+            identity = id(anchor.job)
+            if identity != getattr(self, "_queue_anchor", None):
+                self._queue_anchor = identity
+                anchor.scroll_visible(animate=False)
 
     # ---------------------------------------------------------------- headline
     def describe(
@@ -602,7 +626,6 @@ class DownloadScreen(AskHost):
         palette = self.app.palette
         audio_side = self.query("#delivery-audio-side")
         if audio_side:
-            audio_side.first().display = playback.audio_only
             preview = self.query("#delivery-audio-preview")
             if preview:
                 preview.first(AudioPreviewWidget).set_preview(
@@ -672,9 +695,6 @@ class DownloadScreen(AskHost):
                 chip.display = False
         details = self.query("#delivery-details-body")
         if details:
-            container = self.query("#delivery-details")
-            if container:
-                container.first(VerticalScroll).display = True
             body = Text()
 
             def field(label: str, value: str | Text, style) -> None:
@@ -780,6 +800,7 @@ class DownloadScreen(AskHost):
         self._described = playback
         self._described_tracks = tracks
         self._chapter_playback = playback
+        self._sync_delivery_context_visibility()
         if reset_clock:
             self._download_started_at = time.monotonic()
             self._download_finished_at = None
@@ -789,6 +810,24 @@ class DownloadScreen(AskHost):
             self._animation_frame = 0
         self._render_elapsed()
         self.refresh_keys()
+
+    def _sync_delivery_context_visibility(self) -> None:
+        """An active ask owns the space, including after resize/probe refreshes."""
+        asking = self._current_ask is not None
+        show_details = self._described is not None
+        show_audio = bool(self._described and self._described.audio_only)
+        if asking:
+            # AskHost restores these when the answer is submitted. Remember the
+            # latest description, not the visibility from before the refresh.
+            self._delivery_details_display = show_details
+            self._delivery_audio_side_display = show_audio
+        for selector, wanted in (
+            ("#delivery-details", show_details),
+            ("#delivery-audio-side", show_audio),
+        ):
+            found = self.query(selector)
+            if found:
+                found.first().display = wanted and not asking
 
     def mark_done(self) -> None:
         """Everything queued has been dealt with. Say so, and how to leave."""

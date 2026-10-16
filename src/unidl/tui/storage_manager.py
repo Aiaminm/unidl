@@ -4,9 +4,8 @@ The global settings list used to spend five rows on one practical question:
 where a file goes and what it is called.  This screen keeps the existing
 ``settings.json`` and ``unidl.yaml`` keys intact, but gives them one entry point.
 
-Only ordinary output locations are writable here.  Token, cookie, helper, CDM
-and vault paths are identity-bearing state; phase one shows those paths so they
-can be found without turning a folder edit into an implicit migration.
+Only ordinary output locations are writable here. Service locations and runtime
+state paths can be opened without turning inspection into a path migration.
 """
 
 from __future__ import annotations
@@ -22,7 +21,7 @@ from textual.screen import ModalScreen, Screen
 from textual.widgets import Label, OptionList, Static, Tab, Tabs
 from textual.widgets.option_list import Option
 
-from ..core import naming, template
+from ..core import naming, service_catalog, template
 from ..core.i18n import tr
 from ..core.output_paths import render_episode_folder, validate_episode_folder_template
 from ..core.settings import Settings
@@ -113,6 +112,8 @@ _NAMING_ROWS = (
 )
 
 _ADVANCED_ROWS = (
+    StorageRow("services", "Service directory", "advanced",
+               "The services directory of the UniDL installation running now, not another checkout or Python environment."),
     StorageRow("home", "Runtime home", "advanced", "Parent for runtime state whose path is not overridden."),
     StorageRow("cache", "Cache", "advanced", "Disposable service cache."),
     StorageRow("temp", "Temporary files", "advanced", "Segment and resume scratch space."),
@@ -274,6 +275,11 @@ class StorageManagerScreen(Screen[None]):
             option_list.add_option(Option(self._row_markup(row)))
         target = next((index for index, row in enumerate(rows) if row.key == wanted), 0)
         option_list.highlighted = target
+        self.query_one(KeyBar).render_pairs(
+            *([("enter", "open the folder")] if self._tab == "advanced"
+              else [("enter", "edit"), ("r", "use default")]),
+            ("^b", "back"), ("esc", "quit"),
+        )
 
     def _row_markup(self, row: StorageRow) -> SettingRow:
         value, source = self._display_value(row)
@@ -292,9 +298,10 @@ class StorageManagerScreen(Screen[None]):
             - (len(state_text) if show_state else 0)
             - 12,
         )
+        shown_value = self._short(value, available) if row.editable else value
         return setting_row(
             self.query_one("#storage-list", OptionList), label,
-            f"[$accent]{visual_markup(self._short(value, available))}[/]{state}",
+            f"[$accent]{visual_markup(shown_value)}[/]{state}",
             label_width(tr(f"storage.row.{item.key}", default=item.label) for item in self._rows),
             indent=4,
         )
@@ -333,7 +340,24 @@ class StorageManagerScreen(Screen[None]):
         if row.kind in {"template", "folder-template", "tag"}:
             value = str(self.globals.get(row.key) or "")
             return value or tr("value.none"), tr("storage.source.settings")
-        return str(getattr(self.app.config.paths, row.key)), tr("storage.read_only")
+        return str(self._advanced_path(row)), tr("storage.read_only")
+
+    def _advanced_path(self, row: StorageRow) -> Path:
+        if row.key == "services":
+            return service_catalog.source_root()
+        return Path(getattr(self.app.config.paths, row.key)).expanduser().absolute()
+
+    def _open_advanced(self, row: StorageRow) -> None:
+        path = self._advanced_path(row)
+        # Open a vault's containing folder, never launch SQLite in an editor.
+        folder = path.parent if row.key == "keys_db" else path
+        try:
+            if not folder.is_dir():
+                self.notify(tr("storage.notify.path_missing", path=folder), severity="warning", timeout=8)
+                return
+            self.app.open_path(folder)
+        except (OSError, ValueError) as exc:
+            self.notify(tr("notify.open_fail", path=folder, error=exc), severity="error", timeout=8)
 
     def _editor_value(self, row: StorageRow) -> str:
         if row.kind == "config-path":
@@ -361,11 +385,7 @@ class StorageManagerScreen(Screen[None]):
         if row is None:
             return
         if not row.editable:
-            self.notify(
-                tr("storage.notify.readonly"),
-                severity="warning",
-                timeout=5,
-            )
+            self._open_advanced(row)
             return
 
         def finished(value: str | None) -> None:
@@ -397,6 +417,8 @@ class StorageManagerScreen(Screen[None]):
         self._save_value(row, value)
 
     def _save_value(self, row: StorageRow, value: str) -> bool:
+        if not row.editable:
+            return False
         text = str(value or "").strip()
         if row.kind == "template":
             problems = template.validate(text, _TEMPLATE_FIELDS[row.key])

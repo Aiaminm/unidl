@@ -573,7 +573,8 @@ def service_license_settings(config: Any = None) -> list[Setting]:
             default=True,
             help=(
                 "When enabled, this service may request optional posters, thumbnails "
-                "and artwork and download them as separate files."
+                "and artwork metadata for preview and export. Downloading those "
+                "attachments is a separate Tracks and output setting."
             ),
         ),
         Setting(
@@ -1425,6 +1426,17 @@ TRACK_SETTINGS: list[Setting] = [
             "When the service provides chapter metadata, write it into the final "
             "MKV/MP4 container. Turning this off keeps chapters in the report, "
             "saved command metadata and export, but does not mux them into media."
+        ),
+    ),
+    Setting(
+        "download_attachments",
+        "Download title attachments",
+        "bool",
+        default=True,
+        help=(
+            "After a successful media download, save available attachments beside "
+            "the media. Off keeps attachment metadata, previews and exports but "
+            "does not save attachment files. Fetch title attachments is separate."
         ),
     ),
     Setting(

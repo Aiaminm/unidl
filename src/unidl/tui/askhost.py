@@ -1183,16 +1183,15 @@ class AskHost(Screen):
                     mark()
             self._resolve(BACK)
             return True
-        # Back on a command/result card means "I have read it" and then one normal
-        # navigation step.  The card lives on the current flow page; after it is
-        # dismissed, popping that page reveals the immediate parent.  Keeping the
-        # handler as ``False`` here is important: returning ``True`` consumed the
-        # key and left the user on a blank/finished page, while the old deferred
-        # teardown could jump two levels to the platform list.
+        # The service flow is waiting behind this result, ready to restore its
+        # input/picker (or route back to the root menu). Releasing that gate and
+        # popping this screen in the same action races the new widget's mount
+        # against unmount, leaving the root on its startup placeholder. Let the
+        # resumed flow own the one navigation transition.
         controller = getattr(self, "controller", None)
         if controller is not None and getattr(controller, "card_waiting", False):
             controller.card_read()
-            return False
+            return True
         return self.back_without_ask()
 
     def back_without_ask(self) -> bool:

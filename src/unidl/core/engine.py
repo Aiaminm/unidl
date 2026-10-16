@@ -3294,6 +3294,8 @@ class Engine:
 
     def download_attachments(self, playback: Playback, settings: Settings, *, service: str = "") -> tuple[Path, ...]:
         """Download optional title attachments as independent sidecar files."""
+        if not settings.get("download_attachments", True):
+            return ()
         attachments = tuple(playback.attachments or ())
         if not attachments:
             return ()

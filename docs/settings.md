@@ -23,6 +23,9 @@ home setup notice, open **Settings → Services → Register a service**, and se
 it. Registration records the choice and asks you to restart UniDL; the restart
 is required for the package to be imported in the new process and for the
 registration to take effect on the homepage grid or global search. If you are
+unsure which installation is running, open **Settings → Files & naming →
+Advanced paths**. **Service directory** shows that installation's actual
+service directory. Click the row or press Enter to open it. If you are
 running a source checkout with the `unidl` command from another installation,
 run `uv sync` (or `python -m pip install -e .`) in that checkout, or set
 `UNIDL_SERVICES` to the directory containing the package. Homepage visibility is
@@ -267,7 +270,7 @@ keys and are not duplicated in the main menu.
 ### Files & naming
 
 The global Settings list shows one **Files & naming** row rather than six
-separate path/template rows. Its first-phase tabs are:
+separate path/template rows. Its tabs are:
 
 - **Output locations** — the `download_dir` setting plus `paths.subtitles`,
   `paths.commands` and `paths.exports`. Saving a path creates the directory but
@@ -290,9 +293,22 @@ separate path/template rows. Its first-phase tabs are:
   `H.265`. These values are calculated only after the output picker is
   confirmed, from the tracks the user actually leaves selected—not from its
   automatic initial checkmarks or from the complete manifest inventory.
-- **Advanced paths** — `home`, cache/temp/logs, tokens, cookies, helpers, CDMs and
-  the default local vault. They are deliberately read-only in phase one because
-  changing one is a state migration, not a folder preference.
+- **Advanced paths** — the running installation's **Service directory**,
+  `home`, cache/temp/logs, tokens, cookies, helpers, CDMs and the default
+  local vault. Paths remain read-only: click a row or press Enter to open its
+  folder in the system file manager. The vault row opens its containing folder,
+  not the database. Existing files are never moved and no path setting is changed.
+  Viewing or opening paths creates nothing; missing directories are reported
+  without creating them. Without a desktop opener, UniDL shows the full path
+  instead.
+
+The installed service path is derived from the running package, not guessed from
+the working directory, so source, pip, virtual-environment and uv installations
+show their own location. Copy a completed service package there, register it
+under **Settings → Services → Register a service**, then restart UniDL. This
+read-only row does not add a `paths.services` configuration key; existing
+user-service, custom `UNIDL_SERVICES` and project discovery paths continue to
+work as before.
 
 The hidden compatibility keys remain available to code, existing settings files
 and verification scripts. No service setting or Track output selection setting
@@ -405,6 +421,7 @@ provider API request or replace a service's explicit `license_*` policy.
 | `sub_format` | `srt` / `vtt` / `ass` / `raw` | `srt` |
 | `mux_format` | `mkv` / `mp4` | `mkv` |
 | `embed_chapters` | `on` / `off` | `on` |
+| `download_attachments` | `on` / `off` | `on` |
 | `audio_format` | `source` plus `mp3`, `flac`, and `alac` when supported | `mp3` when supported, otherwise `source` |
 | `workers` | integer | `16` |
 | `concurrent_tracks` | on / off | on |
@@ -526,8 +543,18 @@ are omitted without failing the download.
 its own settings or under **Settings → Services → Title attachments by service**.
 Services should check `fetch_attachments_enabled()` before requesting optional
 posters, thumbnails or artwork, then place them in `Playback.attachments`.
-UniDL previews attachments beside Chapters and Lyrics and downloads them as
-separate files under `<save name>.attachments`; they are never muxed into media.
+UniDL previews attachments beside Chapters and Lyrics.
+
+**Download title attachments** is a separate per-service switch under
+**Tracks and output** (`download_attachments`, on by default to preserve existing
+behavior). It saves available attachments under a separate
+`<save name>.attachments` directory only after the media download succeeds.
+Turn fetching on and downloading off to retain attachment counts, previews,
+saved-command metadata and exports without automatically saving attachment
+files. The download switch does not enable metadata fetching, remove existing
+files, or affect explicitly opening a preview. Attachments are auxiliary: a failed
+attachment never fails an otherwise successful media download, and attachments
+are never muxed into media.
 
 ## Declaring service settings
 

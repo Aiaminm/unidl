@@ -1,5 +1,25 @@
 # Changelog
 
+## [2.4.2] - 2026-10-16
+
+### Advanced paths
+
+- Displayed full read-only runtime paths and the running installation's service directory, with folder-opening actions that left configuration and existing files unchanged.
+
+### Back navigation
+
+- Fixed returning from saved commands, exports and track-only results so the preceding prompt was restored without racing screen teardown or replaying completed work.
+
+### Batch downloads
+
+- Added clickable details for completed, active, failed and queued titles, with selected tracks, output paths, timing and explicit retry controls.
+- Prevented preparation and licence failures from leaving a batch waiting on a hidden question, and made cancellation dismiss pending download prompts without dismissing service or login prompts.
+- Stabilized queue rows and kept track-selection space available when the terminal was resized or a later title refreshed its details.
+
+### Attachments
+
+- Separated attachment previews and metadata from automatic attachment-file downloads with a default-on output setting, and kept attachment failures from failing completed media downloads.
+
 ## [2.4.1] - 2026-10-16
 
 ### Track selection

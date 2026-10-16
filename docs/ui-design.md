@@ -51,6 +51,16 @@ their own top menu; the default puts them on screen 3.
 Settings and Search are overlays on top of whichever screen is current, not
 screens in this sequence.
 
+### Returning from a saved result
+
+Saved download commands, export files and track-only results remain on the flow
+page until read. Back (including the clickable chrome control) or Enter dismisses
+the result and lets the service restore the preceding input or title picker.
+If the next question is the service menu, the controller closes the flow page
+and mounts that menu instead. Dismissal must not pop the page concurrently with
+the restored prompt's mount, cancel the service worker, or replay the completed
+download/export. Batch results remain available until the user dismisses them.
+
 ### Screens replace, never accumulate
 
 Moving from one screen to the next **clears the previous screen's state**. Each

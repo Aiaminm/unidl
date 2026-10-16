@@ -70,6 +70,14 @@ Unknown path keys are ignored so a typo cannot silently redirect runtime state.
 
 ## Paths and runtime state
 
+**Settings → Files & naming → Advanced paths → Service directory** shows the
+services folder of the running installation, alongside runtime paths. Click a
+row or press Enter to open its folder (the containing folder for the key vault),
+without editing its path or moving existing files. Viewing or opening paths
+creates nothing; missing directories are reported without creating them. The
+service row does not add a YAML path override. See
+[Files & naming](settings.md#files--naming).
+
 paths.home is the root for disposable and account-bearing state. Most runtime
 directories below are derived from it; finished downloads are the exception:
 

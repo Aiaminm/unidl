@@ -759,6 +759,86 @@ AttachmentsScreen {
     background: $hover;
 }
 
+/* Batch inspection follows the same compact, scrollable card as chapters. */
+JobDetailsScreen {
+    align: center middle;
+    background: $base 70%;
+}
+#job-modal {
+    width: 100;
+    max-width: 94%;
+    height: 80%;
+    background: $recessed;
+    border-left: solid $accent;
+    padding: 1;
+}
+#job-modal-head {
+    height: 1;
+    padding: 0 1;
+}
+#job-modal-title {
+    width: 1fr;
+    height: 1;
+}
+#job-modal-close {
+    width: 5;
+    height: 1;
+    content-align: right middle;
+    color: $accent;
+}
+#job-modal-close:hover {
+    background: $highlight;
+}
+#job-modal-scroll {
+    height: 1fr;
+    padding: 1;
+    overflow-x: hidden;
+    scrollbar-size-horizontal: 0;
+}
+#job-modal-body {
+    height: auto;
+    width: 1fr;
+    color: $foreground;
+}
+#job-modal-hint {
+    height: auto;
+    padding: 0 1;
+    color: $muted;
+}
+#job-modal-nav {
+    height: 1;
+    align: center middle;
+    margin: 1 0;
+}
+#job-modal-nav Button {
+    width: auto;
+    min-width: 0;
+    height: 1;
+    padding: 0 1;
+    margin: 0 1;
+    border: none;
+    background: transparent;
+    background-tint: transparent;
+    color: $accent;
+}
+#job-modal-nav Button:hover, #job-modal-nav Button:focus {
+    background: $highlight;
+    text-style: underline;
+}
+#job-modal-nav Button:disabled {
+    color: $muted;
+}
+DownloadScreen.active-ask #queue-list {
+    max-height: 4;
+}
+.short #job-modal {
+    height: 90%;
+    padding: 0 1;
+}
+.short #job-modal-nav {
+    margin: 0;
+}
+
 DownloadScreen #ask-area {
     height: auto;
     max-height: 20%;

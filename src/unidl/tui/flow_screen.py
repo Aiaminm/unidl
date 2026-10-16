@@ -76,13 +76,11 @@ class FlowScreen(AskHost):
         """Nothing to answer is three different situations, and they need
         different answers.
 
-        A result on screen is the first of them: the run finished and left its
-        command here, and the service menu is already mounted on the screen
-        underneath - the flow went back to it the moment the command was printed,
-        and this screen was held in front so the command would not vanish with it.
-        So Back means "I have read it": the card goes, this screen goes, and the
-        menu is revealed. Refusing here, or treating it as "still working", is how
-        the one thing the run produced becomes unreachable.
+        Saved-result cards are handled by AskHost before this fallback: Back
+        releases their read gate and the next service ask owns navigation. It
+        reuses this page for the previous input/picker or closes it to show the
+        root menu. Popping at the same time would unmount the restored prompt.
+        Other informational panels may simply be dismissed with their page.
 
         While the flow is running it means the service is between prompts - busy.
         Back cancels that in-flight flow and pops this page, revealing the service
