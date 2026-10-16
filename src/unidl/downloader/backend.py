@@ -7,11 +7,11 @@ runtime dependency on the former standalone downloader application.
 
 from __future__ import annotations
 
-import base64
 import hashlib
 import json
 import threading
 from collections.abc import Sequence
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
 
@@ -35,6 +35,14 @@ from ..core.delivery import (
     StageEvent,
     TrackDescriptor,
     TrackProgressEvent,
+)
+from ..core.manifest_sources import (
+    BUNDLE_MARKER,
+    ManifestSourceError,
+    manifest_json,
+    source_bundle,
+    source_manifest,
+    validate_bundle,
 )
 from ..core.secureio import (
     atomic_write_text,
@@ -181,13 +189,9 @@ class NativeDownloaderBackend:
     def merge(self, manifests: Sequence[ParsedManifest]) -> ParsedManifest:
         """Merge authorized ladders into one runnable JSON-backed manifest.
 
-        A service may return one authorized manifest per requested resolution.  The
-        native parser normally owns each manifest separately, so simply concatenating
-        its ``StreamInfo`` objects would make command export and a later re-parse
-        disagree.  We therefore serialize the already parsed streams into UniDL's
-        typed JSON manifest shape, then keep the native objects as the execution
-        state.  No URL or host is manufactured here; every stream came from one of
-        the service-provided manifests.
+        Keep the original manifest sources for command replay, while native
+        objects remain the in-memory execution state. Never serialize their
+        expanded segment lists into the generated JSON source.
         """
         if not manifests:
             raise ValueError("cannot merge an empty manifest collection")
@@ -263,22 +267,10 @@ class NativeDownloaderBackend:
             )
         )
 
-        document: dict[str, object] = {
-            "video_tracks": [],
-            "audio_tracks": [],
-            "subtitle_tracks": [],
-        }
-        buckets = {
-            "video": document["video_tracks"],
-            "audio": document["audio_tracks"],
-            "subtitle": document["subtitle_tracks"],
-        }
-        for stream in all_streams:
-            media = str(stream.media_type or "").lower()
-            bucket = buckets.get(media)
-            if not isinstance(bucket, list):
-                continue
-            bucket.append(self._json_track(stream))
+        document = source_bundle(
+            [self._source_record(manifest.request) for manifest in manifests],
+            tracks=[self._json_track(stream) for stream in all_streams],
+        )
 
         request = ParseRequest(
             DeliverySource.from_json(document),
@@ -317,20 +309,11 @@ class NativeDownloaderBackend:
             self._merge_timeline_streams(groups[key], duration=duration)
             for key in group_order
         ]
-        document: dict[str, object] = {
-            "video_tracks": [],
-            "audio_tracks": [],
-            "subtitle_tracks": [],
-        }
-        buckets = {
-            "video": document["video_tracks"],
-            "audio": document["audio_tracks"],
-            "subtitle": document["subtitle_tracks"],
-        }
-        for stream in merged_streams:
-            bucket = buckets.get(str(stream.media_type or "").lower())
-            if isinstance(bucket, list):
-                bucket.append(self._json_track(stream))
+        document = source_bundle(
+            [self._source_record(manifest.request) for manifest in manifests],
+            mode="timeline", duration=duration,
+            tracks=[self._json_track(stream) for stream in merged_streams],
+        )
         request = ParseRequest(
             DeliverySource.from_json(document),
             policy=first.request.policy,
@@ -338,66 +321,118 @@ class NativeDownloaderBackend:
         )
         return self.adopt(request, merged_streams)
 
+    @staticmethod
+    def _source_record(request: ParseRequest) -> dict[str, object]:
+        source, policy = request.source, request.policy
+        if source.kind is SourceKind.REFERENCE:
+            record = {"type": "reference", "url": str(source.reference)}
+        elif source.kind in {SourceKind.INLINE_HLS, SourceKind.INLINE_DASH}:
+            record = {
+                "type": "hls" if source.kind is SourceKind.INLINE_HLS else "dash",
+                "text": str(source.inline_text), "base_url": policy.base_url or "",
+            }
+        else:
+            record = {"type": "json", "document": source_manifest(source.json_document)}
+        if policy.headers:
+            record["headers"] = dict(policy.headers)
+        if policy.base_url:
+            record["base_url"] = policy.base_url
+        record["details"] = policy.details and not policy.no_child_playlists
+        record["no_probe"] = policy.no_probe
+        record["append_url_params"] = policy.append_url_params
+        return record
+
     def export_media_manifest(self, manifest: ParsedManifest) -> dict[str, object]:
-        """Snapshot every parsed media track into UniDL's portable JSON dialect.
-
-        HLS media playlists that the picker left lazy are hydrated here. DASH
-        and Smooth Streaming already carry their representation segment lists,
-        so all three adaptive formats cross the same inert JSON boundary on
-        import without asking for the original master manifest again.
-        """
-        request = manifest.request
-        policy = request.policy
-        streams = api.hydrate_streams(
-            api.ParseOptions(
-                input=self._materialize(request),
-                headers=dict(policy.headers),
-                proxy=policy.proxy,
-                use_system_proxy=policy.use_system_proxy,
-                details=True,
-                no_child_playlists=False,
-                no_probe=policy.no_probe,
-                base_url=policy.base_url,
-                append_url_params=policy.append_url_params,
-                ad_keywords=list(policy.ad_keywords),
-                drop_video=policy.drop_video,
-                drop_audio=policy.drop_audio,
-                drop_subtitle=policy.drop_subtitle,
-            ),
-            self.streams(manifest),
-        )
+        """Keep original media playlist/MPD/ISM documents, not parsed segments."""
+        streams = self.streams(manifest)
         if any(stream.is_live for stream in streams):
-            raise ValueError(
-                "a live manifest cannot be frozen as a finite media-track snapshot"
-            )
-        return self._json_manifest(streams, media_snapshot=True)
+            raise ManifestSourceError("A live manifest cannot be exported as finite media playlists.")
+        record = self._source_record(manifest.request)
+        if streams and all(stream.manifest_type == "direct" for stream in streams):
+            # A direct media URL is already the complete source. Never GET the
+            # actual media file while producing a metadata-only export.
+            return source_bundle([record], mode="collection", tracks=[self._json_track(stream) for stream in streams])
+        records = self._media_sources(record, dict(manifest.request.policy.headers))
+        return source_bundle(records, mode="collection", tracks=[self._json_track(stream) for stream in streams])
 
-    def _json_manifest(
-        self,
-        streams: Sequence[StreamInfo],
-        *,
-        media_snapshot: bool = False,
-    ) -> dict[str, object]:
-        document: dict[str, object] = {
-            "video_tracks": [],
-            "audio_tracks": [],
-            "subtitle_tracks": [],
-        }
-        if media_snapshot:
-            # Private marker: generic JSON inputs retain their long-standing
-            # behaviour, while a native export can restore HLS/DASH/ISM stream
-            # semantics and every explicit segment field exactly.
-            document["_unidl_media_manifest"] = 1
-        buckets = {
-            "video": document["video_tracks"],
-            "audio": document["audio_tracks"],
-            "subtitle": document["subtitle_tracks"],
-        }
-        for stream in streams:
-            bucket = buckets.get(str(stream.media_type or "").lower())
-            if isinstance(bucket, list):
-                bucket.append(self._json_track(stream))
-        return document
+    def _media_sources(self, record: dict, inherited_headers: dict[str, str], *, depth: int = 0) -> list[dict]:
+        from . import cli
+        from .detect import guess_kind
+        from .loader import load_text
+        from .parser import _headers_with_resource_cookies
+        from .parsers.hls import parse_hls
+
+        if depth >= 12:
+            raise ManifestSourceError("Manifest source nesting/cycle exceeds the supported limit.")
+        headers = {**inherited_headers, **record.get("headers", {})}
+        kind = record.get("type")
+        if kind == "json":
+            document = record["document"]
+            if BUNDLE_MARKER not in document:
+                return [{**record, "document": source_manifest(document)}]
+            validate_bundle(document)
+            nested = []
+            for child in document["sources"]:
+                nested.extend(self._media_sources(child, headers, depth=depth + 1))
+            return [{**record, "document": source_bundle(
+                nested, mode=document.get("mode", "merge"),
+                duration=document.get("duration", 0), tracks=document.get("tracks"),
+            )}]
+        if kind == "reference":
+            if "export_entry" in record:
+                raise ManifestSourceError(
+                    "A legacy segment export can still be imported from its original file; "
+                    "create a new media export from the original manifest instead."
+                )
+            resource = load_text(record["url"], headers=headers)
+            headers = _headers_with_resource_cookies(headers, resource.headers) or {}
+            text, uri = resource.text or "", record.get("base_url") or resource.uri
+            kind = guess_kind(resource.uri, text)
+        else:
+            text, uri = record.get("text", ""), record.get("base_url", "")
+        base = {key: value for key, value in record.items() if key not in {"url", "text", "document", "type"}}
+        base.update({"base_url": uri, "headers": headers})
+        if kind == "json":
+            return self._media_sources(
+                {**base, "type": "json", "document": source_manifest(json.loads(text))},
+                headers, depth=depth + 1,
+            )
+        if kind in {"dash", "ism"}:
+            return [{**base, "type": kind, "text": text}]
+        if kind != "hls":
+            raise ManifestSourceError("Media export needs an original manifest/playlist, not expanded download state.")
+        children = parse_hls(uri, text, headers=headers, fetch_child_playlists=False)
+        if not children:
+            raise ManifestSourceError("The source media playlist has no tracks.")
+        if any(child.segments for child in children):
+            if any(child.is_live for child in children):
+                raise ManifestSourceError("A live manifest cannot be exported as finite media playlists.")
+            # Already an actual media playlist; preserve the protocol text.
+            return [{**base, "type": "hls", "text": text, "details": False}]
+        if record.get("append_url_params") or cli.should_append_child_url_params(uri):
+            cli._append_input_params(children, uri)
+        session_keys = [line.strip() for line in text.splitlines() if line.strip().startswith("#EXT-X-SESSION-KEY:")]
+
+        def snapshot(child):
+            media = load_text(child.url, headers=headers)
+            child_headers = _headers_with_resource_cookies(dict(headers), media.headers) or {}
+            media_text = media.text or ""
+            if any(tag in media_text for tag in ("#EXT-X-STREAM-INF:", "#EXT-X-MEDIA:")):
+                raise ManifestSourceError("A media playlist unexpectedly points to another master playlist.")
+            parsed = parse_hls(media.uri, media_text, headers=headers, fetch_child_playlists=False)
+            if len(parsed) != 1 or not parsed[0].segments or parsed[0].is_live:
+                raise ManifestSourceError("A source is not a finite media playlist; no partial export was written.")
+            return {
+                **base, "type": "hls", "text": media_text, "headers": child_headers,
+                "base_url": media.uri, "details": False, "track": self._json_track(child),
+                "session_keys": session_keys, "session_base_url": uri,
+            }
+
+        # Read short-lived authorized playlists promptly; never fetch init,
+        # segment or key bytes. map preserves the original track order.
+        with ThreadPoolExecutor(max_workers=min(8, len(children))) as pool:
+            result = list(pool.map(snapshot, children))
+        return [{"type": "json", "document": source_bundle(result, mode="collection")}]
 
     @staticmethod
     def _timeline_stream_key(stream: StreamInfo) -> tuple[object, ...]:
@@ -505,6 +540,8 @@ class NativeDownloaderBackend:
         """Represent one native stream in the parser's portable JSON dialect."""
         record: dict[str, object] = {
             "url": stream.url,
+            "original_url": stream.original_url,
+            "media_type": stream.media_type,
             "manifest_type": stream.manifest_type,
             "id": stream.id,
             "group_id": stream.group_id,
@@ -528,37 +565,25 @@ class NativeDownloaderBackend:
         if kids:
             record["kid"] = kids[0]
             record["key_ids"] = list(kids)
-        if stream.segments:
-            record["segments"] = [
-                {key: value for key, value in {
-                    "url": segment.url,
-                    "duration": segment.duration,
-                    "index": segment.index,
-                    "byte_range": list(segment.byte_range) if segment.byte_range else None,
-                    "allow_range_status_200": segment.allow_range_status_200,
-                    "data_base64": (
-                        base64.b64encode(segment.data).decode("ascii")
-                        if segment.data is not None
-                        else None
-                    ),
-                    "encrypted": segment.encrypted,
-                    "encryption_scheme": segment.encryption_scheme,
-                    "kid": segment.key_id,
-                    "key_uri": segment.key_uri,
-                    "key_iv": segment.key_iv.hex() if segment.key_iv else None,
-                    "program_date_time": segment.program_date_time,
-                    "gap": segment.gap,
-                    "discontinuity_after": segment.discontinuity_after,
-                    "timeline_time": segment.timeline_time,
-                    "timeline_presentation_time": segment.timeline_presentation_time,
-                }.items() if value is not None and value is not False}
-                for segment in stream.segments
-            ]
         # Only retain flags consumed by the native formatter; arbitrary service
         # metadata can contain non-JSON objects and is not needed to download.
         for key in (
             "audio_atmos",
             "muxed_audio",
+            "audio_id",
+            "video_id",
+            "subtitle_id",
+            "group_ids",
+            "audio_ids",
+            "default",
+            "autoselect",
+            "channels_raw",
+            "forced",
+            "sdh",
+            "cc",
+            "closed_captions",
+            "characteristics",
+            "actual_bitrate",
             "dash_full_base_url_mode",
             "media_sequence",
             "target_duration",
@@ -965,7 +990,7 @@ class NativeDownloaderBackend:
             payload = str(source.inline_text or "")
             suffix = ".mpd"
         else:
-            payload = json.dumps(source.json_document, ensure_ascii=False, sort_keys=True)
+            payload = manifest_json(source.json_document)
             suffix = ".json"
         digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()
         path = scratch / f"manifest-{digest}{suffix}"

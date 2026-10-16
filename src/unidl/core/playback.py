@@ -317,6 +317,11 @@ class Playback:
     #: release suffix without duplicating the provisional suffix.
     release_name_base: str = ""
 
+    #: Authorized master references restored from a portable export. Core reads
+    #: exactly these sources without asking an installed service for new API
+    #: variants. Shared headers/proxy/base URL still apply to every source.
+    imported_manifest_urls: tuple[str, ...] = ()
+
     def __post_init__(self) -> None:
         self.save_name = safe_filename(self.save_name, label="Playback.save_name")
         if not self.manifest_url and not self.inline_manifest and self.json_manifest is None:

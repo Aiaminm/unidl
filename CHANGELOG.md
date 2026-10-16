@@ -1,5 +1,22 @@
 # Changelog
 
+## [2.4.1] - 2026-10-16
+
+### Track selection
+
+- Preferred ordinary dialogue audio before bitrate ranking within the selected language and codec filters, while keeping enhanced dialogue, commentary and audio description available through explicit selection and All mode.
+- Applied the same ordinary-audio preference when choosing the default mux audio track.
+
+### Manifest and export size
+
+- Reduced generated JSON manifest and export sizes by preserving original source manifests and request context instead of expanded segment snapshots.
+- Added export format 3 with backward-compatible reading of formats 1 and 2, including merged source profiles and legacy imports.
+- Added bounded JSON generation and atomic export writes that reported oversized or incomplete sources without silently dropping tracks or replacing a valid export.
+
+### Documentation
+
+- Clarified audio-role selection, source-based manifests, export compatibility and file-size limits.
+
 ## [2.4.0] - 2026-10-15
 
 ### Subtitles

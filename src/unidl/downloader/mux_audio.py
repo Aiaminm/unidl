@@ -7,7 +7,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass, replace
 
 from .models import StreamInfo
-from .selection import _LANGUAGE_ALIASES, _audio_sort_key, _extra_bool
+from .selection import _LANGUAGE_ALIASES, _audio_sort_key, _boosted_dialog_audio, _extra_bool
 from .utils import compact_join, pretty_codec
 
 
@@ -94,7 +94,8 @@ def source_default_audio(stream: StreamInfo) -> bool:
 
 def _ordinary(stream: StreamInfo) -> bool:
     return not (
-        "audiodescription" in re.sub(r"\s+", "", _role(stream))
+        _boosted_dialog_audio(stream)
+        or "audiodescription" in re.sub(r"\s+", "", _role(stream))
         or re.search(r"\b(commentary|descriptive|description|secondary)\b", _role(stream))
         or any(_extra_bool(stream, key) for key in ("descriptive", "description", "commentary", "audio_description"))
     )

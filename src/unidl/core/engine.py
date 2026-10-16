@@ -65,6 +65,7 @@ from .delivery import (
     LiveKeyRequest as CoreLiveKeyRequest,
 )
 from .diagnostics import DebugRecorder, activate, safe_log_text
+from .manifest_sources import manifest_json
 from .output_paths import render_episode_folder
 from .playback import Playback, normalize_live_record_limit
 from .secureio import atomic_write_bytes, atomic_write_text, locked_path, private_directory, private_file, safe_filename
@@ -805,22 +806,18 @@ class Engine:
             return manifest
         if playback.json_manifest is None:
             return ""
-        try:
-            payload = json.dumps(
-                playback.json_manifest,
-                ensure_ascii=False,
-                indent=2,
-                sort_keys=True,
-            ) + "\n"
-        except (TypeError, ValueError) as exc:
-            raise ValueError(f"JSON playback manifest is not serializable: {exc}") from exc
+        payload = manifest_json(playback.json_manifest)
         digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()[:12]
         stem = re.sub(r"[^A-Za-z0-9._-]+", ".", playback.save_name).strip(".") or "playback"
-        directory = self.config.paths.temp / "json-manifests"
-        directory.mkdir(parents=True, exist_ok=True)
+        directory = private_directory(self.config.paths.temp / "json-manifests")
         path = directory / f"{stem}.{digest}.json"
-        if not path.exists() or path.read_text("utf-8") != payload:
-            path.write_text(payload, "utf-8")
+        with locked_path(path):
+            if path.is_symlink() or (path.exists() and not path.is_file()):
+                raise ValueError("JSON manifest cache path must be a regular file, not a symlink.")
+            if not path.exists() or path.read_text("utf-8") != payload:
+                atomic_write_text(path, payload)
+            else:
+                private_file(path)
         return str(path)
 
     def fetch_init_segments(
@@ -2436,6 +2433,9 @@ class Engine:
         additional fully authorized :class:`Playback` objects; only then are all
         successful variants parsed and deduplicated by the native backend.
         """
+        if playback.imported_manifest_urls:
+            return self._parse_imported_manifests(playback, settings, service=service)
+
         if playback.merge_manifest_segments and not playback.is_live:
             return self._parse_manifest_segments(playback, settings, service=service)
 
@@ -2536,6 +2536,38 @@ class Engine:
                 streams=streams,
                 manifest=merged,
                 origins=origins,
+                merged_profiles=len(manifests) > 1,
+            ),
+            service,
+        )
+
+    def _parse_imported_manifests(self, playback: Playback, settings: Settings, *, service=None) -> TrackSet:
+        """Reopen only the authorized masters recorded by a portable export."""
+        manifests: list[ParsedManifest] = []
+        origins: dict[int, Playback] = {}
+        for index, url in enumerate(playback.imported_manifest_urls, 1):
+            variant = replace(
+                playback, manifest_url=url, inline_manifest=None, json_manifest=None,
+                alternate_manifest_urls=(), imported_manifest_urls=(), merge_manifests=False,
+            )
+            try:
+                manifest = self._parse_playback_manifest(variant, settings)
+            except Exception as exc:
+                # Losing a source would silently change the exported inventory.
+                # Do not refresh service APIs or expose signed URLs in this error.
+                raise ValueError(
+                    f"Could not read exported manifest {index}/{len(playback.imported_manifest_urls)}; "
+                    "its URL may have expired. No service reauthorization was attempted."
+                ) from exc
+            manifests.append(manifest)
+            origins.update({id(stream): variant for stream in self.downloader.streams(manifest)})
+        merged = self.downloader.merge(manifests) if len(manifests) > 1 else manifests[0]
+        streams = self.downloader.streams(merged)
+        return self._apply_track_filter(
+            playback,
+            TrackSet(
+                streams=streams, manifest=merged,
+                origins={id(stream): origins[id(stream)] for stream in streams},
                 merged_profiles=len(manifests) > 1,
             ),
             service,

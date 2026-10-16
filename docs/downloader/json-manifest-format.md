@@ -140,9 +140,11 @@ Supported audio aliases:
 
 Supported subtitle codecs include WebVTT, TTML/DFXP, and SRT.
 
-## Explicit Segments
+## Legacy Explicit Segments (read-only compatibility)
 
-For already segmented direct inputs, put segment entries on the track.
+Existing segmented JSON inputs can still be read. New generated manifests and
+exports must use original manifest/playlist sources instead of this structure.
+The following is a legacy input example, not the current export format.
 
 ```json
 {
@@ -180,10 +182,88 @@ Segment fields:
 
 Relative segment URLs are resolved against the track URL.
 
-UniDL native **all media manifests** exports use the private
+Older UniDL native **all media manifests** exports used the private
 `_unidl_media_manifest: 1` root marker and a per-track `manifest_type` field to
 restore the exact HLS, DASH or ISM segment semantics. Other JSON manifests do not
 need this marker and retain the generic JSON/direct behavior described above.
+
+### Legacy compact segment tables
+
+Existing format-2 native exports may represent a track's `segments` as an object rather
+than a list. This changes storage only: the parser reconstructs each original
+segment before download, without fetching a master or coalescing byte ranges.
+For example, three adjacent ranges from one URL can be stored as:
+
+```json
+{
+  "segments": {
+    "encoding": "unidl-columns-v1",
+    "count": 3,
+    "defaults": {"url": "https://cdn.example/audio.mp4", "duration": 2.0},
+    "columns": {
+      "index": {"start": 1, "step": 1},
+      "byte_range": {"range_start": 100, "lengths": [500, 600, 550]}
+    }
+  }
+}
+```
+
+`defaults` contains fields present with the same value in every segment.
+Each variable field has a column, using one of these exact representations:
+
+- `values`: one JSON value per segment;
+- `start` and `step`: an integer progression, optionally with
+  `overrides: [[index, value], ...]` for exceptions such as an init index;
+- `runs: [[count, value], ...]`: consecutive repetitions;
+- `range_start` and `lengths`: inclusive byte ranges; an optional `gaps` column
+  describes non-adjacent ranges using the same column rules.
+
+A column's optional `missing` index list distinguishes absent fields from an
+explicit JSON null. Inline init bytes, segment key changes, IVs, timestamps and
+discontinuities remain exact values. Malformed lengths, out-of-range indexes or
+unknown encodings are errors, never a fallback to downloading the full BaseURL.
+Existing explicit segment lists remain supported unchanged. No current writer
+generates either representation; only their compatibility decoder is retained.
+
+## Source bundles and generated JSON caches
+
+Generated temporary JSON and format-3 exports preserve original sources:
+
+```json
+{
+  "_unidl_manifest_sources": 1,
+  "mode": "merge",
+  "sources": [
+    {"type": "reference", "url": "https://cdn.example/profile-a.mpd"},
+    {"type": "reference", "url": "https://cdn.example/profile-b.mpd"}
+  ]
+}
+```
+
+Source records support `reference` (original URL/path), `hls`, `dash` or `ism`
+(original protocol `text` with its `base_url`), and `json` (original source
+`document`). Optional request headers and parser policy remain with the source.
+An HLS media record may carry descriptive `track` metadata and master session-key
+signaling; child encryption signaling takes precedence, and clear tracks remain
+clear. No init, media segment or key bytes are fetched to create a media export.
+
+`merge` combines authorized quality profiles using the normal track deduplication.
+`timeline` joins overlapping source windows using their original sequence
+numbers and optional `duration`. `collection` preserves independent playlists
+without deduplicating distinct renditions. Optional root `tracks` rows preserve
+descriptive corrections and original/default flags; they are not media sources.
+
+Neither JSON `segments` arrays nor compact segment tables may appear in newly
+written source documents. Raw playlists/MPDs naturally retain their own protocol
+segment syntax; parsers expand that syntax only at runtime. Resume checkpoints
+are separate and are not portable export contents.
+
+Generated JSON caches have a **32 MiB** UTF-8 limit and deterministic encoding.
+Exceeding the limit, missing source provenance, unsupported source versions or
+incomplete source collections cause explicit errors; nothing is truncated or
+silently converted to a direct media URL. Existing caches/exports are not
+rewritten or deleted. Legacy imports reference their original files, so keep
+those files when replaying their commands.
 
 ## SegmentBase / Single Direct File Hints
 

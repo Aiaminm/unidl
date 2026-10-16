@@ -164,6 +164,7 @@ def _select_audio(candidates: list[StreamInfo], options: SelectionOptions) -> li
         type_buckets = _audio_type_buckets(candidates, options.audio_type or expr.get("type"))
         buckets = _combine_buckets(candidates, language_buckets, type_buckets)
         for bucket in buckets:
+            bucket = _prefer_ordinary_audio(bucket)
             for target in targets:
                 closest = min(bucket, key=lambda stream: abs((_audio_kbps(stream) or 0) - target), default=None)
                 if closest is not None:
@@ -175,6 +176,7 @@ def _select_audio(candidates: list[StreamInfo], options: SelectionOptions) -> li
             buckets = [candidates]
         selected: list[StreamInfo] = []
         for bucket in buckets:
+            bucket = _prefer_ordinary_audio(bucket)
             selected.extend(_top_n(bucket, _best_count(mode), key=_audio_sort_key))
         return selected
     if quality.startswith("worst"):
@@ -183,9 +185,10 @@ def _select_audio(candidates: list[StreamInfo], options: SelectionOptions) -> li
             buckets = [candidates]
         selected = []
         for bucket in buckets:
+            bucket = _prefer_ordinary_audio(bucket)
             selected.extend(_bottom_n(bucket, _best_count(mode), key=_audio_sort_key))
         return selected
-    return _top_n(candidates, 1, key=_audio_sort_key)
+    return _top_n(_prefer_ordinary_audio(candidates), 1, key=_audio_sort_key)
 
 
 def _select_subtitle(candidates: list[StreamInfo], options: SelectionOptions) -> list[StreamInfo]:
@@ -557,6 +560,10 @@ def _audio_profile_matches(stream: StreamInfo, value: str) -> bool:
             marker in _stream_blob(stream) for marker in ("atmos", "joc", "dolbydigitalplusatmos")
         )
     kinds = _audio_role_tokens(stream)
+    # "Boosted Dialog" is an alternate mix, not ordinary Dialog/Main. Feature
+    # filters such as Atmos remain independent of the audio role.
+    if value in {"dialog", "dialogue", "main", "primary"} and not _ordinary_audio(stream):
+        return False
     aliases = {
         "main": {"main", "primary", "default"},
         "primary": {"main", "primary", "default"},
@@ -564,14 +571,15 @@ def _audio_profile_matches(stream: StreamInfo, value: str) -> bool:
         "audiodescription": {"audiodescription", "descriptive", "description"},
         "commentary": {"commentary"},
         "dialog": {"dialog", "dialogue"},
+        "dialogue": {"dialog", "dialogue"},
     }
     return bool(kinds & aliases.get(value, {value}))
 
 
 def _audio_role_tokens(stream: StreamInfo) -> set[str]:
-    text = _stream_blob(stream).replace("-", " ").replace("_", " ")
+    text = _audio_role_text(stream).replace("-", " ").replace("_", " ")
     tokens = set(re.findall(r"[a-z0-9]+", text))
-    compact = "".join(tokens)
+    compact = re.sub(r"[^a-z0-9]+", "", text)
     if "description" in compact or "descriptive" in compact or "audiodescription" in compact:
         tokens.add("audiodescription")
     if "commentary" in compact:
@@ -581,6 +589,48 @@ def _audio_role_tokens(stream: StreamInfo) -> set[str]:
     if "primary" in tokens or "default" in tokens:
         tokens.add("main")
     return tokens
+
+
+def _audio_role_text(stream: StreamInfo) -> str:
+    # Use track metadata, not signed URL query strings or unrelated codecs.
+    extra = stream.extra if isinstance(stream.extra, dict) else {}
+    fields = (
+        "audio_role", "audio_profile", "audioTrackSubtype", "audio_track_subtype",
+        "audioSubtype", "audioTrackType", "audioTrackId",
+    )
+    values = [stream.role, stream.name, stream.group_id, stream.id]
+    values.extend(extra.get(field) for field in fields)
+    raw = extra.get("raw")
+    if isinstance(raw, dict):
+        values.extend(raw.get(field) for field in (*fields, "role", "name", "group_id"))
+    return " ".join(str(value) for value in values if value).lower()
+
+
+def _boosted_dialog_audio(stream: StreamInfo) -> bool:
+    compact = re.sub(r"[^a-z0-9]+", "", _audio_role_text(stream))
+    return any(marker in compact for marker in (
+        "boosteddialog", "enhanceddialog", "dialogboost", "dialogueboost",
+        "voiceboost", "speechboost", "enhancedspeechintelligibility",
+        "enhancesspeechintelligibility",
+    ))
+
+
+def _ordinary_audio(stream: StreamInfo) -> bool:
+    roles = _audio_role_tokens(stream)
+    return not (
+        _boosted_dialog_audio(stream)
+        or roles & {"audiodescription", "commentary", "secondary"}
+        or _audio_primary_score(stream) == 0
+        or any(_extra_bool(stream, key) for key in ("descriptive", "description", "commentary", "audio_description"))
+    )
+
+
+def _prefer_ordinary_audio(candidates: list[StreamInfo]) -> list[StreamInfo]:
+    # This is only a ranking preference, after hard filters and language
+    # bucketing. Explicit alternate-role filters still work when no ordinary
+    # mix remains. All matching returns earlier without this preference.
+    ordinary = [stream for stream in candidates if _ordinary_audio(stream)]
+    return ordinary or candidates
 
 
 def _subtitle_kinds(stream: StreamInfo) -> set[str]:

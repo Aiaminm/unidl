@@ -37,12 +37,15 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field
 from datetime import datetime
+from io import StringIO
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from .attachments import Attachment
 from .chapters import Chapter
 from .lyrics import Lyrics
+from .manifest_sources import ManifestSourceError, source_bundle, source_manifest
 from .playback import DrmInfo, Playback
 from .secureio import atomic_write_text
 from .titles import Title, TitleKind
@@ -50,7 +53,11 @@ from .titles import Title, TitleKind
 #: The document format. Read strictly: a file from a later version may describe
 #: something this build would silently get wrong, and "it downloaded the wrong
 #: thing" is a worse outcome than "it refused to open the file".
-VERSION = 1
+VERSION = 3
+
+# A complete batch of source manifests must fit this bound. Never replace
+# an earlier valid export with a truncated document or a partial batch.
+MAX_EXPORT_BYTES = 32 * 1024 * 1024
 
 #: what the file is, for anyone who opens it in an editor
 KIND = "unidl-export"
@@ -72,14 +79,6 @@ class ExportError(RuntimeError):
 
 def _text(value: Any) -> str:
     return "" if value is None else str(value)
-
-
-def _json_safe(value: Any) -> bool:
-    try:
-        json.dumps(value)
-    except (TypeError, ValueError):
-        return False
-    return True
 
 
 def normalize_manifest_type(value: Any) -> str:
@@ -218,6 +217,9 @@ class Entry:
     #: Automatic output rules captured with the title so import can preserve
     #: subtitle/audio/video-only batch intent.
     selection: dict[str, Any] = field(default_factory=dict)
+    #: Read-only provenance for legacy segment snapshots. Not serialized.
+    legacy_source_path: str = ""
+    legacy_entry_index: int = 0
 
     def key_ids(self) -> list[str]:
         """The key ids this entry can open, lower-case hex, no dashes."""
@@ -268,8 +270,17 @@ class Entry:
             manifest_url=self.manifest_url or None,
             alternate_manifest_urls=tuple(self.alternate_manifest_urls),
             merge_manifests=self.merge_manifests,
+            imported_manifest_urls=(
+                tuple(dict.fromkeys((self.manifest_url, *self.alternate_manifest_urls)))
+                if self.merge_manifests and self.manifest_url and self.alternate_manifest_urls and self.json_manifest is None
+                else ()
+            ),
             manifest_base_url=self.manifest_base_url or None,
-            json_manifest=self.json_manifest,
+            json_manifest=(
+                source_bundle([{"type": "reference", "url": self.legacy_source_path,
+                                "export_entry": self.legacy_entry_index}])
+                if self.legacy_source_path else self.json_manifest
+            ),
             headers=dict(self.headers),
             proxy=self.proxy or None,
             is_live=self.is_live,
@@ -307,8 +318,8 @@ class Entry:
             document["merge_manifests"] = True
         if self.manifest_base_url:
             document["manifest_base_url"] = self.manifest_base_url
-        if self.json_manifest is not None and _json_safe(self.json_manifest):
-            document["json_manifest"] = self.json_manifest
+        if self.json_manifest is not None:
+            document["json_manifest"] = source_manifest(self.json_manifest)
         if self.headers:
             document["headers"] = dict(self.headers)
         if self.proxy:
@@ -467,6 +478,37 @@ class Document:
         }
 
 
+def _master_references(playback: Playback, tracks: Any) -> tuple[str, ...]:
+    """Recover actual authorized references, never synthesized API requests.
+
+    The backend permits a merge only when parse policies agree. If provenance is
+    absent, an origin is inline/JSON, or request context differs, retain the
+    original source bundle instead of silently dropping part of the inventory.
+    """
+    if not getattr(tracks, "merged_profiles", False) or playback.is_live or playback.merge_manifest_segments:
+        return ()
+    origins = getattr(tracks, "origins", {})
+    urls: list[str] = []
+    for stream in tracks.streams:
+        origin = origins.get(id(stream))
+        if origin is None or origin.inline_manifest or origin.json_manifest is not None:
+            return ()
+        url = str(origin.manifest_url or "")
+        if urlsplit(url).scheme not in {"http", "https"}:
+            return ()
+        if (
+            origin.headers != playback.headers or origin.proxy != playback.proxy
+            or origin.manifest_base_url != playback.manifest_base_url
+        ):
+            return ()
+        if url not in urls:
+            urls.append(url)
+    if playback.manifest_url in urls:
+        urls.remove(playback.manifest_url)
+        urls.insert(0, playback.manifest_url)
+    return tuple(urls)
+
+
 def entry_for(
     playback: Playback,
     tracks: Any = None,
@@ -487,6 +529,15 @@ def entry_for(
     summary = ""
     manifest_url = _text(playback.manifest_url)
     json_manifest = playback.json_manifest
+    if playback.inline_manifest:
+        text = str(playback.inline_manifest)
+        json_manifest = source_bundle([{
+            "type": "hls" if text.lstrip().startswith("#EXTM3U") else "dash",
+            "text": text, "base_url": playback.manifest_base_url or "",
+        }])
+        manifest_url = ""
+    alternate_manifest_urls = tuple(playback.imported_manifest_urls[1:])
+    merge_manifests = bool(alternate_manifest_urls)
     if tracks is not None:
         chosen = {id(stream) for stream in (tracks.selected or [])}
         for stream in tracks.streams:
@@ -496,26 +547,45 @@ def entry_for(
         parsed = getattr(tracks, "manifest", None)
         request = getattr(parsed, "request", None)
         source = getattr(request, "source", None)
-        if getattr(source, "json_document", None) is not None:
+        master_urls = _master_references(playback, tracks) if media_manifest is None else ()
+        if master_urls:
+            manifest_url, *alternate_urls = master_urls
+            alternate_manifest_urls = tuple(alternate_urls)
+            merge_manifests = bool(alternate_manifest_urls)
+            json_manifest = None
+        elif getattr(source, "json_document", None) is not None:
             # A multi-profile ladder is represented by the native backend as one
             # synthetic typed JSON manifest. Export that runnable source rather
             # than only the primary service URL, which would silently discard the
             # additional resolutions on import.
             json_manifest = dict(source.json_document)
             manifest_url = ""
+            alternate_manifest_urls = ()
+            merge_manifests = False
         elif getattr(source, "reference", None):
             manifest_url = _text(source.reference)
+        elif getattr(source, "inline_text", None):
+            json_manifest = source_bundle([{
+                "type": "hls" if source.kind.value == "inline_hls" else "dash",
+                "text": source.inline_text,
+                "base_url": request.policy.base_url or "",
+            }])
+            manifest_url = ""
     if media_manifest is not None:
         # Media mode deliberately replaces the short-lived entry manifest with
-        # a complete inert track/segment inventory. Keep request headers and
+        # original media playlist/MPD/ISM text. Keep request headers and
         # resolved keys on the Entry, but never retain the master as a fallback:
         # doing so would make an expired URL look usable again on import.
         json_manifest = dict(media_manifest)
         manifest_url = ""
+        alternate_manifest_urls = ()
+        merge_manifests = False
     return Entry(
         save_name=playback.save_name,
         title=playback.title,
         manifest_url=manifest_url,
+        alternate_manifest_urls=alternate_manifest_urls,
+        merge_manifests=merge_manifests,
         manifest_base_url=_text(playback.manifest_base_url),
         json_manifest=json_manifest,
         headers=dict(playback.headers),
@@ -540,9 +610,40 @@ def entry_for(
     )
 
 
+def _bounded_json(document: dict[str, Any], *, pretty: bool) -> str:
+    encoder = json.JSONEncoder(
+        indent=2 if pretty else None,
+        separators=None if pretty else (",", ":"),
+        ensure_ascii=False, allow_nan=False,
+    )
+    size = 1  # final newline
+    with StringIO() as buffer:
+        for chunk in encoder.iterencode(document):
+            size += len(chunk.encode("utf-8"))
+            if size > MAX_EXPORT_BYTES:
+                raise ExportError("export size limit exceeded")
+            buffer.write(chunk)
+        buffer.write("\n")
+        return buffer.getvalue()
+
+
 def dumps(document: Document) -> str:
-    """The file's text. Indented, because it is meant to be readable."""
-    return json.dumps(document.as_document(), indent=2, ensure_ascii=False) + "\n"
+    """Source manifests only, bounded before an atomic file replacement."""
+    try:
+        raw = document.as_document()
+        try:
+            return _bounded_json(raw, pretty=True)
+        except ExportError:
+            return _bounded_json(raw, pretty=False)
+    except ManifestSourceError as exc:
+        raise ExportError(str(exc)) from exc
+    except ExportError as exc:
+        raise ExportError(
+            f"Export exceeds the {MAX_EXPORT_BYTES // (1024 * 1024)} MiB safety limit. "
+            "Export fewer titles or use master manifest mode. No export file was written or replaced."
+        ) from exc
+    except (TypeError, ValueError) as exc:
+        raise ExportError("Export contains unsupported JSON data; no export file was written or replaced.") from exc
 
 
 def loads(text: str) -> Document:
@@ -561,7 +662,7 @@ def loads(text: str) -> Document:
 
         return load_third_party(raw)
     version = raw.get("version")
-    if version != VERSION:
+    if type(version) is not int or version not in {1, 2, VERSION}:
         raise ExportError(
             f"made by a different version of the format ({version!r}, this build reads {VERSION})"
         )
@@ -571,13 +672,21 @@ def loads(text: str) -> Document:
     titles = raw.get("titles")
     if not isinstance(titles, list) or not titles:
         raise ExportError("has no titles in it")
-    return Document(
+    document = Document(
         service=service,
         service_name=_text(raw.get("service_name")) or service,
         created=_text(raw.get("created")),
         app=_text(raw.get("app")),
         entries=[_entry_from(entry) for entry in titles],
     )
+    if version == VERSION:
+        for entry in document.entries:
+            if entry.json_manifest is not None:
+                try:
+                    source_manifest(entry.json_manifest)
+                except ManifestSourceError as exc:
+                    raise ExportError(str(exc)) from exc
+    return document
 
 
 def write(path: Path, document: Document) -> Path:  # noqa: D417 - documented below
@@ -601,7 +710,15 @@ def read(path: Path) -> Document:
         text = Path(path).read_text("utf-8")
     except OSError as exc:
         raise ExportError(f"could not be read ({exc})") from exc
-    return loads(text)
+    document = loads(text)
+    for index, entry in enumerate(document.entries):
+        if entry.json_manifest is not None:
+            try:
+                source_manifest(entry.json_manifest)
+            except ManifestSourceError:
+                entry.legacy_source_path = str(Path(path).resolve())
+                entry.legacy_entry_index = index
+    return document
 
 
 #: Parsed documents, keyed by the file's identity rather than by its name: a file

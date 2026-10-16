@@ -5,10 +5,12 @@ import json
 import math
 import re
 from collections.abc import Iterable
+from contextvars import ContextVar
 from datetime import datetime, timezone
 from typing import Any
 from urllib.parse import parse_qs, parse_qsl, urlencode, urlparse, urlunparse
 
+from ...core.manifest_sources import BUNDLE_MARKER, ManifestSourceError, expand_segments, validate_bundle
 from ..audio import audio_metadata_from_title
 from ..models import SegmentInfo, StreamInfo
 from ..utils import join_uri
@@ -16,6 +18,7 @@ from .sabr_ump import parse_sabr_ump_streams
 
 _DEFAULT_DVR_SEGMENT_SECONDS = 5.0
 _DVR_DURATION_MARGIN_SEGMENTS = 12
+_SOURCE_DEPTH = ContextVar("unidl_manifest_source_depth", default=0)
 _DURATION_TEXT_UNITS = re.compile(
     r"(?P<value>\d+(?:\.\d+)?)\s*(?P<unit>hours?|hrs?|hr|h|minutes?|mins?|min|m|seconds?|secs?|sec|s)\b",
     re.IGNORECASE,
@@ -23,14 +26,213 @@ _DURATION_TEXT_UNITS = re.compile(
 _DURATION_TEXT_CLOCK = re.compile(r"\b(?:(\d{1,2}):)?(\d{1,2}):(\d{2})\b")
 
 
-def parse_json(uri: str, text: str, headers: dict[str, str] | None = None) -> list[StreamInfo]:
-    data = json.loads(text)
+def parse_json(
+    uri: str, text: str, headers: dict[str, str] | None = None, *,
+    probe_direct: bool = True, fetch_child_playlists: bool = True,
+) -> list[StreamInfo]:
+    return _parse_document(uri, json.loads(text), headers, probe_direct, fetch_child_playlists)
+
+
+def _parse_document(uri, data, headers, probe_direct, fetch_child_playlists):
+    depth = _SOURCE_DEPTH.get()
+    if depth >= 12:
+        raise ManifestSourceError("Manifest source nesting/cycle exceeds the supported limit.")
+    token = _SOURCE_DEPTH.set(depth + 1)
+    try:
+        if isinstance(data, dict) and BUNDLE_MARKER in data:
+            return _parse_source_bundle(uri, data, headers, probe_direct, fetch_child_playlists)
+        return _parse_track_document(uri, data, headers)
+    finally:
+        _SOURCE_DEPTH.reset(token)
+
+
+def _parse_track_document(uri, data, headers):
     streams: list[StreamInfo] = []
     for title in _titles(data):
         streams.extend(_parse_title(uri, title, headers=headers))
     if streams:
         return streams
     return _parse_generic_url_tracks(uri, data)
+
+
+def _source_headers(stored, current):
+    # A caller may supply refreshed authentication, including a differently
+    # cased header name. Never send both old and refreshed credentials.
+    result = dict(stored or {})
+    for name, value in (current or {}).items():
+        for old in list(result):
+            if old.casefold() == name.casefold():
+                del result[old]
+        result[name] = value
+    return result
+
+
+def _parse_source_bundle(uri, document, headers, probe_direct, fetch_child_playlists):
+    from ...core.delivery import DeliverySource, ParseRequest
+    from ..backend import NativeDownloaderBackend
+
+    validate_bundle(document)
+
+    def read_record(record):
+        try:
+            streams = _parse_source_record(uri, record, headers, probe_direct, fetch_child_playlists)
+        except ManifestSourceError:
+            raise
+        except Exception as exc:
+            raise ManifestSourceError(
+                "Could not read one of the saved manifest sources. "
+                "No tracks were silently discarded and no service reauthorization was attempted."
+            ) from exc
+        if not streams:
+            raise ManifestSourceError("A saved manifest source contains no readable tracks; no partial ladder was used.")
+        return streams
+
+    if document["mode"] == "collection":
+        from ..cli import _sort_streams
+
+        streams = []
+        for record in document["sources"]:
+            streams.extend(read_record(record))
+        if not streams:
+            raise ManifestSourceError("The saved source collection contains no readable tracks.")
+        _restore_track_metadata(streams, document.get("tracks", []))
+        return _sort_streams(streams)
+    backend = NativeDownloaderBackend()
+    manifests = []
+    # This request is only an in-memory grouping context. No source is written
+    # or reparsed while native runtime objects are merged.
+    request = ParseRequest(DeliverySource.from_json({}))
+    for record in document["sources"]:
+        streams = read_record(record)
+        _restore_track_metadata(streams, document.get("tracks", []))
+        manifests.append(backend.adopt(request, streams))
+    if document["mode"] == "timeline":
+        result = backend.merge_segments(manifests, duration=document.get("duration", 0))
+    else:
+        result = backend.merge(manifests)
+    streams = backend.streams(result)
+    _restore_track_metadata(streams, document.get("tracks", []))
+    return streams
+
+
+def _parse_source_record(uri, record, headers, probe_direct, fetch_child_playlists):
+    from .. import cli
+    from ..loader import load_text
+    from ..parser import parse_source
+    from .dash import parse_dash
+    from .hls import _session_key_info, parse_hls
+    from .ism import parse_ism
+
+    kind = record["type"]
+    current_headers = _source_headers(record.get("headers"), headers)
+    base = record.get("base_url") or uri
+    probe = probe_direct and not record.get("no_probe", False)
+    details = fetch_child_playlists and record.get("details", True)
+    if kind == "reference":
+        reference = join_uri(uri, record["url"])
+        if "export_entry" in record:
+            # Legacy exports are read from their existing file, not copied into
+            # a newly generated segment snapshot.
+            raw = json.loads(load_text(reference, headers=current_headers).text or "")
+            index = record["export_entry"]
+            if not isinstance(raw, dict) or raw.get("kind") != "unidl-export" or raw.get("version") not in (1, 2):
+                raise ManifestSourceError("The referenced legacy export is not supported.")
+            entries = raw.get("titles")
+            if not isinstance(entries, list) or not 0 <= index < len(entries):
+                raise ManifestSourceError("The referenced legacy export entry is missing.")
+            entry = entries[index]
+            if not isinstance(entry, dict) or not isinstance(entry.get("json_manifest"), dict):
+                raise ManifestSourceError("The referenced legacy export has no JSON manifest.")
+            streams = _parse_document(
+                entry.get("manifest_base_url") or reference, entry["json_manifest"],
+                _source_headers(entry.get("headers"), current_headers), probe, details,
+            )
+        else:
+            streams = parse_source(
+                reference, headers=current_headers, probe_direct=probe,
+                fetch_child_playlists=details, base_url=record.get("base_url") or None,
+            )
+        param_source = record.get("base_url") or reference
+    elif kind == "json":
+        streams = _parse_document(base, record["document"], current_headers, probe, details)
+        param_source = base
+    else:
+        text = record["text"]
+        if kind == "hls":
+            streams = parse_hls(base, text, headers=current_headers, fetch_child_playlists=details)
+            if record.get("track"):
+                if len(streams) != 1:
+                    raise ManifestSourceError("A saved media playlist must describe exactly one track.")
+                _apply_track_metadata(streams[0], record["track"])
+            session = _session_key_info(record.get("session_base_url") or base, ["#EXTM3U", *record.get("session_keys", [])])
+            # Exactly the native master/child semantics: a clear child stays
+            # clear; a child's own key rotation always takes precedence.
+            if session:
+                for stream in streams:
+                    if not stream.encrypted:
+                        continue
+                    has_kids = any(segment.key_id for segment in stream.segments)
+                    for segment in stream.segments:
+                        if not segment.encrypted:
+                            continue
+                        segment.encryption_scheme = segment.encryption_scheme or session.encryption_scheme
+                        if not has_kids:
+                            segment.key_id = segment.key_id or session.key_id
+                        segment.key_uri = segment.key_uri or session.key_uri
+                        segment.key_iv = segment.key_iv or session.key_iv
+                    kids = list(dict.fromkeys(segment.key_id for segment in stream.segments if segment.key_id))
+                    if kids:
+                        stream.extra.update(key_id=kids[0], key_ids=kids)
+        elif kind == "dash":
+            streams = parse_dash(base, text)
+        else:
+            streams = parse_ism(base, text)
+        param_source = base
+    if record.get("append_url_params") or cli.should_append_child_url_params(param_source):
+        cli._append_input_params(streams, param_source)
+    for stream in streams:
+        if current_headers:
+            effective = _source_headers(current_headers, stream.extra.get("_unidl_source_headers"))
+            stream.extra["_unidl_source_headers"] = effective
+            raw = dict(stream.extra.get("raw") or {})
+            raw["headers"] = _source_headers(raw.get("headers"), effective)
+            stream.extra["raw"] = raw
+    return streams
+
+
+def _restore_track_metadata(streams, records):
+    # Match the original representation, not its position in a newly parsed
+    # manifest. Never use these descriptive rows to synthesize media tracks.
+    indexed = {}
+    for record in records:
+        key = (record.get("url"), record.get("id"), record.get("group_id"))
+        indexed.setdefault(key, []).append(record)
+    for stream in streams:
+        matches = indexed.get((stream.url, stream.id, stream.group_id), [])
+        if len(matches) == 1:
+            _apply_track_metadata(stream, matches[0])
+
+
+def _apply_track_metadata(stream, record):
+    for field in (
+        "media_type", "url", "original_url", "id", "group_id", "name", "language", "role", "bandwidth", "codecs",
+        "resolution", "frame_rate", "channels", "extension", "video_range", "duration", "size_bytes",
+    ):
+        if record.get(field) is not None:
+            setattr(stream, field, record[field])
+    for field in (
+        "audio_atmos", "muxed_audio", "is_original", "is_default",
+        "audio_id", "video_id", "subtitle_id", "group_ids", "audio_ids",
+        "default", "autoselect", "channels_raw", "forced", "sdh", "cc",
+        "closed_captions", "characteristics", "actual_bitrate", "dash_full_base_url_mode",
+    ):
+        if field in record:
+            stream.extra[field] = record[field]
+    # Encryption and segment KIDs belong to the parsed source, not a stale
+    # descriptive row. Keep corrected init KIDs only for encrypted streams.
+    if stream.encrypted and not stream.extra.get("key_ids") and record.get("key_ids"):
+        stream.extra["key_ids"] = list(record["key_ids"])
+        stream.extra["key_id"] = record["key_ids"][0]
 
 
 def _titles(data: Any) -> list[dict[str, Any]]:
@@ -481,6 +683,10 @@ def _track_segments_from_item(
     size_bytes: int | None,
 ) -> list[SegmentInfo]:
     explicit = item.get("segments")
+    if isinstance(explicit, dict):
+        # A compact native export must never fall back to a single direct file
+        # when its table is invalid or belongs to an unknown encoding.
+        return _explicit_track_segments(expand_segments(explicit), base_url, encrypted, scheme, kid)
     if isinstance(explicit, list):
         segments = _explicit_track_segments(explicit, base_url, encrypted, scheme, kid)
         if segments:
@@ -625,7 +831,7 @@ def _dvr_segment_records(title: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def _explicit_track_segments(
-    values: list[Any],
+    values: Iterable[Any],
     base_url: str,
     encrypted: bool,
     scheme: str | None,

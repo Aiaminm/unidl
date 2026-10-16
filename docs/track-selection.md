@@ -106,10 +106,22 @@ is accepted as an alias for the Atmos profile. `audio_codec=ac4` matches raw
 `audio_quality=best` or `worst` ranks only tracks left after all of those filters.
 It never widens a language, codec, profile, or channel condition.
 
+`audio_profile=dialog` means ordinary dialogue, not Voice Booster, Boosted
+Dialog, or enhanced-dialogue mixes. For Best, Worst, and target-bitrate selection,
+UniDL prefers ordinary audio within each already-filtered language group before
+ranking quality. Commentary, audio description, and enhanced-dialogue tracks do
+not displace an available ordinary mix simply because they appear first or have
+a higher bitrate. If no ordinary mix passes the filters, Any profile can still
+use an alternate mix; an explicit Dialog profile instead reports no match and
+leaves audio unchecked for manual selection.
+
 `audio_selection=best` keeps the best matching track per language. Empty language
 settings are treated as the service's best-language behavior; an explicit list
 keeps the selection inside that list. `audio_selection=all` keeps every matching
 track, including duplicate renditions, commentary, and alternate channel layouts.
+With Any profile, All matching also retains Voice Booster and other enhanced
+mixes. These tracks always remain available in the manual picker; explicit
+name/group/role filters can also target them.
 
 For example, `audio_codec=ac4`, `audio_langs=en`, and `audio_selection=best`
 does not select every English audio track. It selects the best English AC-4 track
@@ -135,10 +147,11 @@ Auto, Original, or Specify a language and enter one tag:
 | `original` | Prefer selected audio explicitly marked as original. Do not infer original language from the service's country or interface language. |
 | A single tag such as `en`, `fr-CA`, `es-419`, `und`, or a provider tag | Prefer selected audio matching that language. ISO aliases and case/underscore normalization are accepted. A primary tag such as `en` includes regional forms; a regional tag such as `en-GB` requires that region and does not silently become `en-US`. |
 
-Within matching candidates, ordinary/main audio takes precedence over commentary
-or audio description. If only commentary/description was selected, it remains
-eligible. Multiple candidates at the same priority use the existing Audio Best
-ranking; exact ties keep their stable selected-track order.
+Within matching candidates, ordinary/main audio takes precedence over commentary,
+audio description, and Voice Booster/enhanced-dialogue mixes. If only alternate
+mixes were selected, they remain eligible. Multiple candidates at the same
+priority use the existing Audio Best ranking; exact ties keep their stable
+selected-track order.
 
 If the requested language or original marker is missing, UniDL reports a warning
 and falls back to Auto. It does not fetch additional tracks or cancel the job.

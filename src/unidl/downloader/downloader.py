@@ -19,6 +19,7 @@ from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qsl, unquote_to_bytes, urlencode, urljoin, urlparse, urlunparse
 
+from ..core.manifest_sources import source_request_headers
 from .bbts import bbts_part_is_complete
 from .embedding import (
     DownloadCancelled,
@@ -420,6 +421,7 @@ def download_stream(
     host_limiter: _HostAdaptiveLimiter | None = None,
     gate: Callable[[], None] | None = None,
 ) -> DownloadResult:
+    headers = source_request_headers(stream.extra, headers)
     output_path = _output_path(stream, output_dir, filename)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 

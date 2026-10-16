@@ -9444,6 +9444,9 @@ def _print_dash_byte_range_note(streams, colors: bool | None = None) -> None:
 
 
 def _hydrate_stream(stream, headers: dict[str, str], no_probe: bool, base_url: str | None = None):
+    from ..core.manifest_sources import source_request_headers
+
+    headers = source_request_headers(stream.extra, headers) or {}
     if stream.segments:
         return stream
     if stream.manifest_type not in {"hls", "m3u"}:
@@ -9544,6 +9547,9 @@ def _hydrate_selected_stream_key_ids(
     *,
     force: bool = False,
 ) -> None:
+    from ..core.manifest_sources import source_request_headers
+
+    headers = source_request_headers(stream.extra, headers) or {}
     if _is_sabr_stream(stream):
         if _should_probe_selected_sabr_stream_key_ids(stream):
             _hydrate_selected_sabr_stream_key_ids(stream, headers=headers, request_timeout=request_timeout, keys=keys)

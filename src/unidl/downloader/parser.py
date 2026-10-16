@@ -54,7 +54,10 @@ def _parse_manifest_resource(
     if kind == "ism":
         return parse_ism(parse_uri, resource.text or "")
     if kind == "json":
-        return parse_json(parse_uri, resource.text or "", headers=headers)
+        return parse_json(
+            parse_uri, resource.text or "", headers=headers,
+            probe_direct=probe_direct, fetch_child_playlists=fetch_child_playlists,
+        )
     return parse_direct(source, headers=headers, probe=probe_direct)
 
 

@@ -34,20 +34,44 @@ and will use it again when the package is discovered.
 **Export manifest type** is stored independently in each registered service's
 `settings.json` namespace. The legacy/default value is **master manifest**: a
 native export retains the original authorized MPD, ISM or HLS entry exactly as
-before. **All media manifests** replaces that entry in the export with UniDL's
-complete parsed video/audio/subtitle inventory, including finite segment URLs,
-byte ranges, encryption fields and generated init data. Import can then open the
-ladder without requesting the original master again. This is useful for services
-whose master URL expires within seconds or minutes.
+before. When multiple authorized master manifests were merged, it records all
+contributing master URLs instead of expanding their complete segment lists.
+Import reads exactly those saved URLs, without asking the installed service to
+authorize fresh variants. If an original reference cannot be recovered safely
+(for example an inline JSON source or a concatenated timeline), a bundle of the
+original sources and required track metadata is retained instead. Missing
+provenance is an explicit error, never a silently incomplete export.
+
+**All media manifests** stores original MPD/ISM text or the original HLS media
+playlists, plus the track metadata needed to interpret them. It does **not**
+write parsed segment lists, range tables or generated init bytes into JSON.
+Import expands the saved protocol documents through the normal parsers, without
+requesting the original master again. A direct media URL or an original JSON
+track list remains a source reference; export does not download the media.
 
 The export choice is a third setting boundary, separate from both provider
 manifest profile and final track selection. Media export records every parsed
 track, not only the tracks selected for that run; the imported title can therefore
 be selected again as long as its required content keys and media URLs are still
-valid. It does not renew CDN authorization: if the segment URLs themselves expire,
-the export expires with them. Live manifests are never frozen as a static segment
+valid. It does not renew CDN authorization: if the media URLs themselves expire,
+the export expires with them. Live manifests are never frozen as a static media
 snapshot; even when a service is configured for media export, live playback keeps
 its refreshable original manifest and reports that fallback in the log.
+
+Native exports use format version 3. New JSON manifests and exports store source
+documents, not expanded downloader state. Raw MPD/HLS/ISM text naturally contains
+its own segment syntax; UniDL does not duplicate that syntax as JSON segment
+objects. Expanded segments belong only to runtime parsing and resume caches.
+Version-1 and version-2 exports remain readable from their existing files;
+their segment snapshots are not copied into new files. Keep the original file
+when replaying such an import. Older readers reject version 3 explicitly.
+
+Each export file, including an entire batch, is limited to **32 MiB**.
+Smaller documents remain indented; a large source bundle may
+use compact JSON spacing to fit the limit. If it still exceeds the limit, export
+fails explicitly before replacing or creating the file. An existing batch file
+remains intact. Use smaller batches or Master mode; UniDL does not truncate
+tracks, discard titles or switch modes silently to force the file to fit.
 
 If you installed a minimal distribution with no service packages, the home
 screen shows the same import path and links to Settings. Copy a service into the
