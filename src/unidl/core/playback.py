@@ -14,6 +14,7 @@ from typing import Any
 from .attachments import Attachment, normalize_attachments
 from .chapters import Chapter, normalize_chapters
 from .lyrics import Lyrics
+from .manifest_sources import merge_source_metadata
 from .secureio import safe_filename
 from .titles import Title
 
@@ -199,6 +200,32 @@ class SubtitleReference:
     name: str = ""
     original: bool = False
     selected: bool = False
+    format: str = ""
+    headers: dict[str, str] = field(default_factory=dict)
+    sources: tuple[dict[str, str], ...] = ()
+
+    def as_document(self) -> dict[str, Any]:
+        result = {
+            "url": self.url, "language": self.language, "kind": self.kind,
+            "name": self.name, "original": self.original, "selected": self.selected,
+        }
+        if self.format:
+            result["format"] = self.format
+        if self.headers:
+            result["headers"] = dict(self.headers)
+        if self.sources:
+            result["sources"] = merge_source_metadata(self.sources)
+        return result
+
+    @classmethod
+    def from_document(cls, document: dict[str, Any]) -> SubtitleReference:
+        return cls(
+            url=document["url"], language=document.get("language") or "und",
+            kind=document.get("kind") or "normal", name=document.get("name") or "",
+            original=document.get("original", False), selected=document.get("selected", False),
+            format=document.get("format") or "", headers=dict(document.get("headers") or {}),
+            sources=tuple(merge_source_metadata(document.get("sources", []))),
+        )
 
 
 @dataclass

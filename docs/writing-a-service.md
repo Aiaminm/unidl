@@ -36,6 +36,25 @@ or press Enter to open it; do not assume the command uses a nearby source
 checkout. After copying a package there, register it under **Settings →
 Services → Register a service** and restart UniDL.
 
+### Portable subtitle and profile metadata
+
+Use `Playback.requested`, `returned` and `note` for public source-profile/type
+labels. Core retains these per successfully parsed manifest variant; do not
+place playback envelopes, client objects or licence session state in these
+fields. JSON track sources should retain their provider `profile` and `kind`
+alongside their direct URLs.
+
+Advertise independent subtitles with `Playback.subtitle_references` and expose
+them through `augment_tracks()` as usual. A `SubtitleReference` may additionally
+declare `format` (for example `vtt`, `ttml` or `srt`) and explicit subtitle
+`headers`; shared request headers remain on `Playback`. Use the actual returned
+subtitle format, not the format produced later by your conversion hook.
+Core gathers references from successful manifest variants, preserves the
+complete inventory in portable exports and generated merged JSON sources, and
+restores it for installed-service sidecar hooks. Generic imports can download
+ordinary subtitle URLs without the service. A subtitle whose delivery requires
+provider-specific processing still needs that service's implementation.
+
     cp -r src/unidl/services/example src/unidl/services/mysvc
 
 Then edit `ID`, `NAME`, `TAG`, and delete the hooks you do not implement. A

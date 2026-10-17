@@ -100,7 +100,7 @@ class StreamInfo:
             return "Vid"
         return "Med"
 
-    def format_line(self, index: int | None = None) -> str:
+    def format_line(self, index: int | None = None, *, include_region: bool = True) -> str:
         from .utils import (
             compact_join,
             format_bitrate,
@@ -108,12 +108,20 @@ class StreamInfo:
             format_size,
             format_time,
             pretty_codec,
+            track_region_name,
         )
 
         prefix = self.display_prefix()
         if self.encrypted:
             prefix = f"{prefix} *{self.encryption_scheme or 'ENC'}"
 
+        region_name = (
+            track_region_name(
+                self.language, self.extra.get("audioTrackId"), self.group_id, self.id, self.name,
+            )
+            if include_region and self.media_type in {"audio", "subtitle", "subtitles", "text"}
+            else None
+        )
         descriptor = self.role or (self.name if self.media_type == "video" else None)
         common_tail: list[str | None] = [
             self.segment_summary(),
@@ -144,6 +152,7 @@ class StreamInfo:
                 display_name,
                 codec_label,
                 self.language,
+                region_name,
                 f"{self.channels}CH" if self.channels else None,
                 *common_tail,
             ]
@@ -154,6 +163,7 @@ class StreamInfo:
             parts = [
                 self.group_id or self.id,
                 self.language,
+                region_name,
                 display_name,
                 pretty_codec(self.codecs, self.media_type),
                 *common_tail,

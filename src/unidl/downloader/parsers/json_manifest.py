@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import math
 import re
@@ -10,7 +11,15 @@ from datetime import datetime, timezone
 from typing import Any
 from urllib.parse import parse_qs, parse_qsl, urlencode, urlparse, urlunparse
 
-from ...core.manifest_sources import BUNDLE_MARKER, ManifestSourceError, expand_segments, validate_bundle
+from ...core.manifest_sources import (
+    BUNDLE_MARKER,
+    ManifestSourceError,
+    expand_segments,
+    merge_source_metadata,
+    source_metadata,
+    subtitle_source_identity,
+    validate_bundle,
+)
 from ..audio import audio_metadata_from_title
 from ..models import SegmentInfo, StreamInfo
 from ..utils import join_uri
@@ -96,7 +105,7 @@ def _parse_source_bundle(uri, document, headers, probe_direct, fetch_child_playl
         if not streams:
             raise ManifestSourceError("The saved source collection contains no readable tracks.")
         _restore_track_metadata(streams, document.get("tracks", []))
-        return _sort_streams(streams)
+        return _sort_streams(_with_source_subtitles(uri, streams, document, headers))
     backend = NativeDownloaderBackend()
     manifests = []
     # This request is only an in-memory grouping context. No source is written
@@ -112,6 +121,54 @@ def _parse_source_bundle(uri, document, headers, probe_direct, fetch_child_playl
         result = backend.merge(manifests)
     streams = backend.streams(result)
     _restore_track_metadata(streams, document.get("tracks", []))
+    return _with_source_subtitles(uri, streams, document, headers)
+
+
+def _with_source_subtitles(uri, streams, document, headers):
+    """API subtitles are real sources, not descriptive MPD track corrections."""
+    for reference in document.get("subtitle_sources", []):
+        item = {
+            **reference,
+            "id": "api-subtitle-" + hashlib.sha256(
+                subtitle_source_identity(reference).encode("utf-8")
+            ).hexdigest()[:16],
+            "group_id": reference.get("kind") or "normal",
+            "codec": reference.get("format") or None,
+            "extension": reference.get("format") or None,
+            "is_original": reference.get("original", False),
+            "forced": reference.get("kind") == "forced",
+            "sdh": reference.get("kind") in {"sdh", "cc"},
+            "encrypted": False,
+        }
+        stream = _subtitle_stream(uri, {}, item, {})
+        if stream is None:
+            raise ManifestSourceError("An independent subtitle source is unreadable.")
+        stream.name = reference.get("name") or None
+        stream.extra.update(
+            portable_subtitle_reference=dict(reference),
+            subtitle_reference_url=stream.url,
+            subtitle_kind=item["group_id"],
+            subtitle_original=reference.get("original", False),
+            source_metadata=merge_source_metadata(reference.get("sources")),
+        )
+        # Subtitle-specific request context overrides the manifest's headers.
+        scoped = _source_headers(headers, reference.get("headers"))
+        if reference.get("headers"):
+            stream.extra["_unidl_subtitle_headers"] = dict(reference["headers"])
+        if scoped:
+            stream.extra["_unidl_source_headers"] = scoped
+            stream.extra["raw"]["headers"] = scoped
+        existing = next((
+            existing for existing in streams
+            if existing.extra.get("portable_subtitle_reference") is not None
+            and subtitle_source_identity(existing.extra["portable_subtitle_reference"]) == subtitle_source_identity(reference)
+        ), None)
+        if existing is None:
+            streams.append(stream)
+        else:
+            combined = merge_source_metadata(existing.extra.get("source_metadata"), reference.get("sources"))
+            existing.extra["portable_subtitle_reference"] = {**reference, "sources": combined}
+            existing.extra["source_metadata"] = combined
     return streams
 
 
@@ -191,6 +248,12 @@ def _parse_source_record(uri, record, headers, probe_direct, fetch_child_playlis
     if record.get("append_url_params") or cli.should_append_child_url_params(param_source):
         cli._append_input_params(streams, param_source)
     for stream in streams:
+        metadata = source_metadata({
+            "url": record.get("url") or record.get("base_url") or "",
+            **record.get("metadata", {}),
+        })
+        if record.get("metadata") and not stream.extra.get("source_metadata"):
+            stream.extra["source_metadata"] = [metadata]
         if current_headers:
             effective = _source_headers(current_headers, stream.extra.get("_unidl_source_headers"))
             stream.extra["_unidl_source_headers"] = effective
@@ -209,6 +272,11 @@ def _restore_track_metadata(streams, records):
         indexed.setdefault(key, []).append(record)
     for stream in streams:
         matches = indexed.get((stream.url, stream.id, stream.group_id), [])
+        if len(matches) > 1 and stream.extra.get("source_metadata"):
+            matches = [
+                record for record in matches
+                if any(item in record.get("source_metadata", []) for item in stream.extra["source_metadata"])
+            ]
         if len(matches) == 1:
             _apply_track_metadata(stream, matches[0])
 
@@ -221,6 +289,7 @@ def _apply_track_metadata(stream, record):
         if record.get(field) is not None:
             setattr(stream, field, record[field])
     for field in (
+        "source_metadata", "subtitle_kind", "subtitle_original",
         "audio_atmos", "muxed_audio", "is_original", "is_default",
         "audio_id", "video_id", "subtitle_id", "group_ids", "audio_ids",
         "default", "autoselect", "channels_raw", "forced", "sdh", "cc",
@@ -228,6 +297,12 @@ def _apply_track_metadata(stream, record):
     ):
         if field in record:
             stream.extra[field] = record[field]
+    public_raw = {
+        key: record[key] for key in ("profile", "kind", "forced", "sdh", "descriptive")
+        if key in record
+    }
+    if public_raw:
+        stream.extra["raw"] = {**stream.extra.get("raw", {}), **public_raw}
     # Encryption and segment KIDs belong to the parsed source, not a stale
     # descriptive row. Keep corrected init KIDs only for encrypted streams.
     if stream.encrypted and not stream.extra.get("key_ids") and record.get("key_ids"):

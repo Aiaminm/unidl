@@ -92,6 +92,8 @@ class ParseRequest:
     source: DeliverySource
     policy: ParsePolicy = field(default_factory=ParsePolicy)
     scratch_dir: Path | None = None
+    #: Public profile/type labels only; no provider client or DRM session state.
+    metadata: Mapping[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)

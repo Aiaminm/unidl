@@ -65,7 +65,7 @@ from .delivery import (
     LiveKeyRequest as CoreLiveKeyRequest,
 )
 from .diagnostics import DebugRecorder, activate, safe_log_text
-from .manifest_sources import manifest_json
+from .manifest_sources import manifest_json, merge_source_metadata, subtitle_source_identity, with_subtitle_sources
 from .output_paths import render_episode_folder
 from .playback import Playback, normalize_live_record_limit
 from .secureio import atomic_write_bytes, atomic_write_text, locked_path, private_directory, private_file, safe_filename
@@ -368,7 +368,7 @@ class _StructuredProgressScreen:
                     segments,
                     speed,
                     eta,
-                    "Done ✓" if update.done else "",
+                    ("Recorded ✓" if update.live else "Downloaded ✓") if update.done else "",
                 )
             )
 
@@ -2370,6 +2370,9 @@ class Engine:
                 base_url=playback.manifest_base_url,
             ),
             scratch_dir=self.config.paths.temp / "manifests",
+            metadata={key: value for key, value in (
+                ("requested", playback.requested), ("returned", playback.returned), ("note", playback.note),
+            ) if value},
         )
 
     def parse_options(self, playback: Playback, settings: Settings):
@@ -2502,6 +2505,26 @@ class Engine:
             if last_error is not None:
                 raise last_error
             raise ValueError("Playback did not provide a usable manifest")
+        # Independent APIs may advertise subtitles outside their MPDs. Include
+        # every successfully parsed variant before the primary service augments
+        # the picker; never export failed authorizations or their private state.
+        references = {}
+        for variant in successful_variants:
+            for reference in variant.subtitle_references:
+                item = replace(
+                    reference,
+                    sources=tuple(merge_source_metadata(reference.sources or [exports._playback_metadata(variant)])),
+                )
+                identity = subtitle_source_identity(item.as_document())
+                previous = references.get(identity)
+                if previous is not None:
+                    item = replace(
+                        item, selected=item.selected or previous.selected,
+                        original=item.original or previous.original,
+                        sources=tuple(merge_source_metadata(previous.sources, item.sources)),
+                    )
+                references[identity] = item
+        playback.subtitle_references = list(references.values())
         if len(manifests) == 1:
             streams = self.downloader.streams(manifests[0])
             origin = successful_variants[0]
@@ -2672,9 +2695,35 @@ class Engine:
         if callable(augment):
             extra = augment(playback, tracks, self.log)
             if extra is not None:
-                tracks.sidecars.extend(
-                    stream for stream in extra if isinstance(stream, StreamInfo)
-                )
+                extra = [stream for stream in extra if isinstance(stream, StreamInfo)]
+                claimed = {
+                    (stream.extra.get("subtitle_reference_url"), stream.language,
+                     stream.extra.get("subtitle_kind") or stream.group_id or "normal")
+                    for stream in extra if stream.extra.get("service_sidecar") == "subtitle"
+                }
+                # On import the portable source is executable without a plugin.
+                # An installed plugin can take ownership of that exact subtitle
+                # again; keep its prepare_download hook, never download both.
+                native = [
+                    stream for stream in tracks.streams
+                    if not (
+                        stream.extra.get("portable_subtitle_reference")
+                        and (stream.extra.get("subtitle_reference_url"), stream.language,
+                             stream.extra.get("subtitle_kind") or stream.group_id or "normal") in claimed
+                    )
+                ]
+                if len(native) != len(tracks.streams):
+                    tracks.streams = native
+                    if tracks.manifest is not None:
+                        tracks.manifest = self.downloader.adopt(tracks.manifest.request, native)
+                    tracks.origins = {id(stream): tracks.origins[id(stream)] for stream in native if id(stream) in tracks.origins}
+                tracks.sidecars.extend(extra)
+        if tracks.manifest is not None and tracks.manifest.request.source.json_document is not None:
+            subtitles = exports._subtitle_sources(playback, tracks)
+            if subtitles:
+                request = tracks.manifest.request
+                source = DeliverySource.from_json(with_subtitle_sources(request.source.json_document, subtitles))
+                tracks.manifest = self.downloader.adopt(replace(request, source=source), tracks.streams)
         filter_tracks = getattr(service, "filter_tracks", None)
         if not callable(filter_tracks):
             return tracks

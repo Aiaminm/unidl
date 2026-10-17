@@ -5,6 +5,7 @@ import math
 import os
 import re
 import tempfile
+from functools import lru_cache
 from pathlib import Path
 from urllib.parse import unquote, urljoin, urlparse
 
@@ -176,6 +177,117 @@ def uri_basename(value: str) -> str:
 def compact_join(parts: list[str | None], separator: str = " | ") -> str:
     cleaned = [part.strip() for part in parts if part and str(part).strip()]
     return separator.join(cleaned)
+
+
+_LANGUAGE_REGION = re.compile(
+    r"(?:[A-Za-z]{2,3}(?:-[A-Za-z]{3}){0,3}|[A-Za-z]{4}|[A-Za-z]{5,8})"
+    r"(?:-[A-Za-z]{4})?-(?P<region>[A-Za-z]{2}|[0-9]{3})"
+    r"(?:-(?:[A-Za-z0-9]{5,8}|[0-9][A-Za-z0-9]{3}))*"
+    r"(?:-[0-9A-WY-Za-wy-z](?:-[A-Za-z0-9]{2,8})+)*"
+    r"(?:-[xX](?:-[A-Za-z0-9]{1,8})+)?"
+)
+
+
+@lru_cache(maxsize=1)
+def _region_names() -> dict[str, str]:
+    # UN M49 macroregions are regions, not countries. In particular, es-419
+    # must not be guessed as Spain or any single Latin American country.
+    names = {
+        "001": "World",
+        "002": "Africa",
+        "003": "North America",
+        "005": "South America",
+        "009": "Oceania",
+        "011": "Western Africa",
+        "013": "Central America",
+        "014": "Eastern Africa",
+        "015": "Northern Africa",
+        "017": "Middle Africa",
+        "018": "Southern Africa",
+        "019": "Americas",
+        "021": "Northern America",
+        "029": "Caribbean",
+        "030": "Eastern Asia",
+        "034": "Southern Asia",
+        "035": "South-eastern Asia",
+        "039": "Southern Europe",
+        "053": "Australia and New Zealand",
+        "054": "Melanesia",
+        "057": "Micronesia",
+        "061": "Polynesia",
+        "142": "Asia",
+        "143": "Central Asia",
+        "145": "Western Asia",
+        "150": "Europe",
+        "151": "Eastern Europe",
+        "154": "Northern Europe",
+        "155": "Western Europe",
+        "202": "Sub-Saharan Africa",
+        "419": "Latin America and the Caribbean",
+    }
+    # Load only the small, bundled country table, once and on first use. Track
+    # rendering must not fetch location data or load the much larger city table.
+    try:
+        from geonamescache import GeonamesCache
+    except ImportError:
+        return names
+    for code, country in GeonamesCache().get_countries().items():
+        names[code] = country["name"]
+        names[str(country["isonumeric"]).zfill(3)] = country["name"]
+    return names
+
+
+@lru_cache(maxsize=512)
+def language_region_name(language: str | None) -> str | None:
+    """English name of an explicit BCP-47 region, never inferred from language.
+
+    Scripts, variants and extensions are not countries. A private-use tag such
+    as en-x-us therefore has no region; zh-Hant-HK does. Keep the original tag
+    untouched for selection, mux metadata, filenames and manifest round trips.
+    """
+    if not language:
+        return None
+    match = _LANGUAGE_REGION.fullmatch(language.strip().replace("_", "-"))
+    if match is None:
+        return None
+    return _region_names().get(match.group("region").upper())
+
+
+def track_region_name(language: str | None, *identifiers: str | None) -> str | None:
+    """Prefer the language tag, then an unambiguous locale in track metadata.
+
+    Some manifests say lang="en" but audioTrackId="en-us_dialog_0". The
+    locale prefix is explicit region evidence, unlike a bare language. Only
+    use identifiers starting with the same primary language; do not scan URLs,
+    arbitrary words or role suffixes for things that look like country codes.
+    """
+    region = language_region_name(language)
+    if region:
+        return region
+    primary = str(language or "").strip().replace("_", "-").split("-", 1)[0].casefold()
+    if not re.fullmatch(r"[a-z]{2,8}", primary) or primary in {"und", "mul", "zxx"}:
+        return None
+    regions: set[str] = set()
+    for identifier in identifiers:
+        if not isinstance(identifier, str) or not identifier:
+            continue
+        candidate = identifier.strip()
+        if candidate.replace("_", "-").split("-", 1)[0].casefold() != primary:
+            continue
+        # Keep a full BCP-47 tag when available; otherwise strip only the
+        # provider's underscore-delimited track-role/representation suffix.
+        region = language_region_name(candidate)
+        if region is None:
+            parts = candidate.split("_")
+            # A locale can itself use underscores, e.g. zh_Hant_HK_dialog_0.
+            # Six subtags cover language, up to three extlangs, script and region.
+            for end in range(min(len(parts), 6), 0, -1):
+                region = language_region_name("_".join(parts[:end]))
+                if region:
+                    break
+        if region:
+            regions.add(region)
+    return next(iter(regions)) if len(regions) == 1 else None
 
 
 def format_bitrate(value: int | None) -> str | None:

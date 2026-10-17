@@ -18,14 +18,16 @@ def guess_kind(source: str, content: str | None = None) -> str:
     if content:
         stripped = content.lstrip("\ufeff\r\n\t ")
         upper = stripped[:500].upper()
+        # Source bundles may embed raw MPD/ISM/HLS text as JSON strings.
+        # Recognise the outer document before sniffing for embedded markup.
+        if stripped.startswith("{") or stripped.startswith("["):
+            return "json"
         if upper.startswith("#EXTM3U"):
             return "hls"
         if "<MPD" in stripped[:1000] or ":MPD" in stripped[:1000]:
             return "dash"
         if "<SMOOTHSTREAMINGMEDIA" in upper:
             return "ism"
-        if stripped.startswith("{") or stripped.startswith("["):
-            return "json"
 
     if path.endswith(".ism/manifest") or path.endswith(".isml/manifest") or path.endswith("/manifest"):
         return "ism"

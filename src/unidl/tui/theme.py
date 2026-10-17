@@ -59,6 +59,9 @@ class Palette:
     atmos: str
     audio_vivid: str
 
+    # source-language badge, deliberately separate from stream-format colours
+    original: str
+
     #: Lines rather than letters: the rule under the log, and the scrollbar thumb.
     #: Its own role because it is the one colour that is *not* text, and it used to
     #: borrow ``highlight`` - a selected-row background, which against the page is
@@ -103,6 +106,7 @@ DARK = Palette(
     hdr_vivid="#2ac3de",
     atmos="#9ece6a",
     audio_vivid="#d386b7",
+    original="#8eaaa4",
     rule="#525252",
     bg="#141414",
     panel="#1c1c1c",
@@ -150,6 +154,7 @@ LIGHT = Palette(
     hdr_vivid="#08727f",
     atmos="#2f6b21",
     audio_vivid="#8a2b72",
+    original="#42665e",
     rule="#a9a6a0",
     bg="#f7f6f3",
     panel="#edebe6",
@@ -206,6 +211,7 @@ def textual_theme(palette: Palette) -> Theme:
             "hdr-vivid": palette.hdr_vivid,
             "atmos": palette.atmos,
             "audio-vivid": palette.audio_vivid,
+            "original": palette.original,
             "rule": palette.rule,
             "base": palette.bg,
             "recessed": palette.panel,

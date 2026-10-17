@@ -208,6 +208,15 @@ explicit app exit.
 The progress card consumes structured Core events. It does not capture terminal
 stdout or ask the standalone CLI to own the screen.
 
+Transfer completion is labelled **Downloaded**, not completion of the whole
+job. Post-processing rows put the current phase before any filename, so a long
+temporary path cannot hide decryption or conversion status. Audio conversion
+reports FFmpeg's processed media time, speed relative to playback and, when the
+track duration is known, percentage and estimated remaining time. An unknown
+duration leaves the percentage and estimate out rather than inventing them.
+Only a successful FFmpeg exit completes conversion; reaching the end of media
+still allows time for tags, cover art, chapters and the output trailer.
+
 Audio-only delivery is the one intentional delivery-layout variant. Its track
 picker keeps album art and ID3 metadata in a left preview rail while the right
 rail is used for track selection. Once downloading starts, progress and mux
@@ -215,13 +224,22 @@ status occupy the left side and the same artwork/metadata preview stays on the
 right. Video VOD and live recording do not create this rail and retain the
 full-width layout above.
 
+Below 112 columns, the delivery artwork rail is hidden to give active progress
+the full width. It returns when the window is widened; the track picker and
+stored artwork are unchanged.
+
 ### Track row colour
 
-Track text receives a subtle semantic palette role while the checkbox remains the
-only selection state. Dolby Vision and CBCS use `accent`; HDR/HLG and AES/SAMPLE
-encryption use `warn`; ordinary CENC/CTR uses `manifest`; unknown encryption is
-`muted`; clear SDR remains normal foreground. These are role names rather than
-fixed hues, so both dark and light palettes retain useful contrast.
+Track rows retain the normal foreground; the checkbox remains the selection
+state. Only exceptional format badges (Dolby Vision, HDR10/HDR10+, HLG, HDR Vivid,
+Atmos and Audio Vivid) receive their own semantic colours.
+
+The existing `Original` word on audio and subtitle tracks uses a separate
+`original` role: a quiet grey-teal, lighter on dark surfaces and darker on light
+surfaces. Only the word is highlighted, including when it follows another role
+such as `Dialog Original` or `Forced Original`. The picker and download-track
+details share the same role. Track identifiers containing `_original_` are not
+badges, and styling never changes which tracks qualify as original.
 
 ## Interaction
 
@@ -392,6 +410,7 @@ white is barely legible, so `ok` is a deeper green there while staying green.
 | `ok` | success, keys | `#9ece6a` | `#3c7a1e` |
 | `warn` | warnings, live | `#e0af68` | `#8a5a00` |
 | `error` | failures | `#f7768e` | `#b3243b` |
+| `original` | original audio/subtitle badge | `#8eaaa4` | `#42665e` |
 | `bg` | base | `#141414` | `#fbfbfb` |
 | `panel` | recessed blocks | `#1c1c1c` | `#f1f1f1` |
 | `highlight` | selected row | `#242424` | `#e6e2f2` |

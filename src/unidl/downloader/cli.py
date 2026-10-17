@@ -100,6 +100,7 @@ from .mux_audio import normalize_default_audio, resolve_default_audio
 from .mux_subtitle import normalize_default_subtitle, resolve_default_subtitle
 from .parser import parse_source
 from .postprocess import (
+    FFmpegProgress,
     MuxInput,
     RawKey,
     _mp4_normalize_large_sample_durations,
@@ -1447,6 +1448,28 @@ class _TrackStatusSpinner:
         if self.thread is None:
             self._render(0)
 
+    def set_media_progress(self, update: FFmpegProgress) -> None:
+        if update.finalizing:
+            self.states = tuple(
+                state.replace("Transcoding", "Finalizing").replace("Remuxing", "Finalizing")
+                for state in self.states
+            )
+        parts = []
+        if update.percent is not None:
+            parts.append(f"{update.percent:.1f}%")
+        if update.speed is not None:
+            parts.append(f"{update.speed:.1f}x")
+        if update.eta_seconds is not None:
+            parts.append(f"ETA {_media_progress_clock(update.eta_seconds)}")
+        clock = _media_progress_clock(update.processed_seconds)
+        if update.duration_seconds is not None:
+            clock += f"/{_media_progress_clock(update.duration_seconds)}"
+        parts.append(clock)
+        self.progress = " " + " · ".join(parts)
+        # FFmpeg publishes at a bounded cadence; flush phase transitions even
+        # when a short conversion finishes before the next spinner tick.
+        self._render(0)
+
     def _render(self, frame_index: int) -> None:
         frame = self.reporter.spinner_frames[frame_index % len(self.reporter.spinner_frames)]
         states = list(_spinner_states(self.states, frame))
@@ -1577,17 +1600,24 @@ def _spinner_text(text: str, frame: str) -> str:
     return text.replace("{spinner}", frame)
 
 
+def _media_progress_clock(seconds: float) -> str:
+    hours, remainder = divmod(max(0, int(seconds)), 3600)
+    minutes, seconds = divmod(remainder, 60)
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+
 def _format_track_status_line(index: int, stream, path: Path, states: Sequence[str], colors: bool | None = None) -> str:
     prefix = f"{index:>3}. {stream.display_prefix():<3} : "
     status = " | ".join(_color_track_status_state(state, colors) for state in states)
-    tail = f" | {status}" if status else ""
-    path_text = _short_status_path(path, max_len=78)
     label_color = Palette.cyan
     if stream.media_type == "audio":
         label_color = Palette.green
     elif _is_subtitle_stream(stream):
         label_color = Palette.magenta
-    return f"{paint(prefix, label_color, colors)}{path_text}{tail}"
+    # The header/log already owns the output path. A hidden staging path used
+    # to consume the whole row and push the active phase off the visible card.
+    detail = status or _short_status_path(Path(path.name), max_len=78)
+    return f"{paint(prefix, label_color, colors)}{detail}"
 
 
 def _color_track_status_state(state: str, colors: bool | None = None) -> str:
@@ -1598,7 +1628,7 @@ def _color_track_status_state(state: str, colors: bool | None = None) -> str:
         return paint(state, Palette.yellow, colors)
     if "error" in normalized or "failed" in normalized:
         return paint(state, Palette.red, colors)
-    if any(word in normalized for word in ("decrypting", "converting", "transcoding", "repacking", "recording", "muxing")):
+    if any(word in normalized for word in ("decrypting", "converting", "transcoding", "finalizing", "repacking", "recording", "muxing")):
         return paint(state, Palette.cyan, colors)
     if "✓" in state or any(word in normalized for word in ("downloaded", "decrypted", "converted", "recorded", "repacked", "muxed")):
         return paint(state, Palette.green, colors)
@@ -2347,8 +2377,12 @@ def _download_selected_stream(
         if audio_format:
             audio_label = audio_format.upper()
             previous_path = current_path
-            with status.spinning("Downloaded ✓", f"Finalizing {audio_label} {{spinner}}"):
-                current_path = _transcode_audio_output(current_path, result.path, stream, args, headers)
+            phase = "Remuxing" if _audio_output_copies_stream(stream, audio_format) else "Transcoding"
+            with status.spinning(f"{phase} {audio_label} {{spinner}}") as conversion_status:
+                current_path = _transcode_audio_output(
+                    current_path, result.path, stream, args, headers,
+                    progress_callback=conversion_status.set_media_progress,
+                )
             _cleanup_replaced_intermediate(previous_path, current_path, args, colors)
             if current_path not in cleanup_paths:
                 cleanup_paths.append(current_path)
@@ -4924,8 +4958,13 @@ def _record_live_streams(live_streams, all_streams, args, headers, keys, output,
         audio_format = _audio_format_for_stream(result.stream, args)
         if audio_format:
             audio_label = audio_format.upper()
-            with status.spinning("Recorded ✓", f"Finalizing {audio_label} {{spinner}}"):
-                current_path = _transcode_audio_output(current_path, result.path, result.stream, args, headers)
+            phase = "Remuxing" if _audio_output_copies_stream(result.stream, audio_format) else "Transcoding"
+            with status.spinning(f"{phase} {audio_label} {{spinner}}") as conversion_status:
+                current_path = _transcode_audio_output(
+                    current_path, result.path, result.stream, args, headers,
+                    progress_callback=conversion_status.set_media_progress,
+                    duration_seconds=result.recorded_seconds,
+                )
             if current_path not in cleanup_paths:
                 cleanup_paths.append(current_path)
             status.set_path(current_path)
@@ -5222,12 +5261,24 @@ def _audio_source_download_name(name: str | None, stream, args: argparse.Namespa
     return name
 
 
+def _audio_output_copies_stream(stream, output_format: str) -> bool:
+    return (
+        (output_format == "mp3" and _stream_is_mp3_audio(stream))
+        or (output_format == "alac" and _stream_is_alac_audio(stream))
+        or (output_format == "flac" and _stream_is_flac_audio(stream))
+        or output_format == "m4a"
+    )
+
+
 def _transcode_audio_output(
     current_path: Path,
     source_path: Path,
     stream,
     args: argparse.Namespace,
     headers: dict[str, str] | None,
+    *,
+    progress_callback: Callable[[FFmpegProgress], None] | None = None,
+    duration_seconds: float | None = None,
 ) -> Path:
     output_format = _audio_format_for_stream(stream, args)
     if not output_format:
@@ -5250,13 +5301,9 @@ def _transcode_audio_output(
         metadata=audio_id3_metadata(stream),
         cover_path=_audio_cover_path(stream, args, headers),
         chapters_file=getattr(args, "chapters_file", None),
-        copy_audio=(
-            output_format == "mp3" and _stream_is_mp3_audio(stream)
-        ) or (
-            output_format == "alac" and _stream_is_alac_audio(stream)
-        ) or (
-            output_format == "flac" and _stream_is_flac_audio(stream)
-        ) or output_format == "m4a",
+        copy_audio=_audio_output_copies_stream(stream, output_format),
+        duration_seconds=duration_seconds if duration_seconds is not None else getattr(stream, "duration", None),
+        progress_callback=progress_callback,
     )
     if replace_source:
         os.replace(converted, desired_path)
@@ -7269,7 +7316,7 @@ def _stream_match_text(stream) -> str:
     return " ".join(
         str(part)
         for part in [
-            stream.format_line(),
+            stream.format_line(include_region=False),
             stream.id,
             stream.group_id,
             stream.name,

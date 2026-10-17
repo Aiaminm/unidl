@@ -123,6 +123,17 @@ If the selected source is already identified as MP3, the audio stream is copied 
 
 All MP3 outputs use ID3v2.3.
 
+### Conversion progress
+
+The download reaching 100% means the source bytes have arrived; it does not mean
+the output file is ready. The following **Transcoding MP3** row shows actual
+processed media time and FFmpeg speed (for example, `200x` means 200 times
+playback speed). Percentage and ETA use the already-known track duration, with
+no extra media probe. If duration or speed is unavailable, the corresponding
+estimate is omitted. Copying an already-compatible codec is labelled
+**Remuxing** instead. Conversion reaches 100% only after FFmpeg exits
+successfully, including its final metadata and container writes.
+
 ### macOS xHE-AAC decoder compatibility
 
 When transcoding xHE-AAC on macOS, UniDL checks the first audio stream's

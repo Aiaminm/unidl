@@ -1,5 +1,23 @@
 # Changelog
 
+## [2.4.3] - 2026-10-17
+
+### Track information
+
+- Highlighted the Original badge on audio and subtitle rows consistently in track selection and download details, with separate dark and light theme colours.
+- Displayed full country or region names alongside explicit language tags and unambiguous matching locale metadata, without changing language filters, mux metadata or filenames.
+
+### Portable exports
+
+- Preserved requested and returned profile labels, source associations and the complete independent subtitle inventory, including unselected languages, subtitle kinds, original flags and request headers.
+- Restored portable subtitle sources for generic imports while allowing installed services to retain their custom sidecar hooks without duplicate tracks.
+- Fixed JSON source detection when a generated document contained embedded manifest markup.
+
+### Download progress
+
+- Distinguished completed transfers from completed processing and displayed audio transcoding or remuxing progress with processed time, speed and available percentage and ETA.
+- Kept processing status visible ahead of long filenames and hid the audio artwork rail in narrow download windows to preserve progress space.
+
 ## [2.4.2] - 2026-10-16
 
 ### Advanced paths

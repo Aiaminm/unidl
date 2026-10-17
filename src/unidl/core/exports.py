@@ -35,7 +35,7 @@ What it does not decide
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from io import StringIO
 from pathlib import Path
@@ -45,8 +45,18 @@ from urllib.parse import urlsplit
 from .attachments import Attachment
 from .chapters import Chapter
 from .lyrics import Lyrics
-from .manifest_sources import ManifestSourceError, source_bundle, source_manifest
-from .playback import DrmInfo, Playback
+from .manifest_sources import (
+    BUNDLE_MARKER,
+    ManifestSourceError,
+    merge_source_metadata,
+    source_bundle,
+    source_manifest,
+    source_metadata,
+    subtitle_source_identity,
+    validate_bundle,
+    with_subtitle_sources,
+)
+from .playback import DrmInfo, Playback, SubtitleReference
 from .secureio import atomic_write_text
 from .titles import Title, TitleKind
 
@@ -192,6 +202,8 @@ class Entry:
     proxy: str = ""
     is_live: bool = False
     note: str = ""
+    requested: str = ""
+    returned: str = ""
     drm_system: str = ""
     pssh: str = ""
     wrm_header: str = ""
@@ -287,6 +299,12 @@ class Entry:
             drm=drm,
             keys=list(self.keys),
             note=self.note,
+            requested=self.requested,
+            returned=self.returned,
+            subtitle_references=[
+                SubtitleReference.from_document(item)
+                for item in (self.json_manifest or {}).get("subtitle_sources", [])
+            ],
             chapters=list(self.chapters),
             attachments=list(self.attachments),
             lyrics=self.lyrics,
@@ -328,6 +346,10 @@ class Entry:
             document["is_live"] = True
         if self.note:
             document["note"] = self.note
+        if self.requested:
+            document["requested"] = self.requested
+        if self.returned:
+            document["returned"] = self.returned
         drm: dict[str, Any] = {}
         if self.drm_system:
             drm["system"] = self.drm_system
@@ -406,6 +428,8 @@ def _entry_from(document: dict[str, Any]) -> Entry:
         proxy=_text(document.get("proxy")),
         is_live=bool(document.get("is_live")),
         note=_text(document.get("note")),
+        requested=_text(document.get("requested")),
+        returned=_text(document.get("returned")),
         drm_system=_text(drm.get("system")),
         pssh=_text(drm.get("pssh")),
         wrm_header=_text(drm.get("wrm_header")),
@@ -478,6 +502,80 @@ class Document:
         }
 
 
+def _playback_metadata(playback: Playback) -> dict[str, str]:
+    return source_metadata({
+        "url": playback.manifest_url or playback.manifest_base_url or "",
+        "requested": playback.requested, "returned": playback.returned, "note": playback.note,
+    })
+
+
+def _subtitle_sources(playback: Playback, tracks: Any) -> list[dict[str, Any]]:
+    """Export all available API subtitles, not only the selected languages."""
+    origins = [playback]
+    for origin in getattr(tracks, "origins", {}).values():
+        if all(origin is not item for item in origins):
+            origins.append(origin)
+    visible = [*getattr(tracks, "streams", []), *getattr(tracks, "sidecars", [])]
+    selected = {id(stream) for stream in getattr(tracks, "selected", [])}
+    rows: dict[str, SubtitleReference] = {}
+    for origin in origins:
+        for reference in origin.subtitle_references:
+            matching = [
+                stream for stream in visible
+                if stream.extra.get("subtitle_reference_url") == reference.url
+                and stream.language == reference.language
+                and (stream.extra.get("subtitle_kind") or stream.group_id or "normal") == reference.kind
+                and (
+                    not stream.extra.get("portable_subtitle_reference")
+                    or subtitle_source_identity(stream.extra["portable_subtitle_reference"]) == subtitle_source_identity(reference.as_document())
+                )
+            ]
+            # Shared headers already live on Entry. Only explicit subtitle
+            # overrides should outrank caller-supplied refreshed headers.
+            headers = dict(reference.headers)
+            suffix = Path(urlsplit(reference.url).path).suffix.lower().lstrip(".")
+            source_format = suffix if suffix in {"srt", "vtt", "webvtt", "ttml", "dfxp", "ass", "ssa"} else ""
+            item = replace(
+                reference, headers=headers,
+                format=reference.format or source_format or next((stream.extension for stream in matching if stream.extension), ""),
+                selected=any(id(stream) in selected for stream in matching) if matching else reference.selected,
+                sources=tuple(merge_source_metadata(reference.sources or [_playback_metadata(origin)])),
+            )
+            identity = subtitle_source_identity(item.as_document())
+            previous = rows.get(identity)
+            if previous is not None:
+                item = replace(item, selected=item.selected or previous.selected,
+                               original=item.original or previous.original,
+                               sources=tuple(merge_source_metadata(previous.sources, item.sources)))
+            rows[identity] = item
+    # Generic imports keep native subtitle records rather than service sidecars.
+    # Preserve their provenance even after an export is imported and re-exported.
+    result = [item.as_document() for item in rows.values()]
+    for stream in visible:
+        reference = stream.extra.get("portable_subtitle_reference")
+        if reference is None and stream.extra.get("service_sidecar") == "subtitle" and stream.url:
+            if any(
+                item["url"] == (stream.extra.get("subtitle_reference_url") or stream.url)
+                and item["language"] == (stream.language or "und")
+                and item["kind"] == (stream.extra.get("subtitle_kind") or stream.group_id or "normal")
+                for item in result
+            ):
+                continue
+            reference = SubtitleReference(
+                url=str(stream.extra.get("subtitle_reference_url") or stream.url),
+                language=stream.language or "und",
+                kind=stream.extra.get("subtitle_kind") or stream.group_id or "normal",
+                name=stream.name or "", format=stream.extension or "",
+                original=bool(stream.extra.get("subtitle_original")),
+                sources=tuple(merge_source_metadata(stream.extra.get("source_metadata"), [_playback_metadata(playback)])),
+            ).as_document()
+        if reference and not any(
+            subtitle_source_identity(item) == subtitle_source_identity(reference) for item in result
+        ):
+            result.append({**reference, "selected": id(stream) in selected})
+    return result
+
+
 def _master_references(playback: Playback, tracks: Any) -> tuple[str, ...]:
     """Recover actual authorized references, never synthesized API requests.
 
@@ -487,13 +585,28 @@ def _master_references(playback: Playback, tracks: Any) -> tuple[str, ...]:
     """
     if not getattr(tracks, "merged_profiles", False) or playback.is_live or playback.merge_manifest_segments:
         return ()
+    parsed = getattr(tracks, "manifest", None)
+    source = getattr(getattr(parsed, "request", None), "source", None)
+    document = getattr(source, "json_document", None)
+    if document and BUNDLE_MARKER in document:
+        records = document.get("sources", [])
+        # Runtime dedup may remove every representation from a variant. Its
+        # provenance must survive even when no remaining object points to it.
+        origin_count = len({id(origin) for origin in getattr(tracks, "origins", {}).values()})
+        if any(record.get("metadata") for record in records) or len(records) > origin_count:
+            return ()
     origins = getattr(tracks, "origins", {})
     urls: list[str] = []
+    labels: dict[str, dict[str, str]] = {}
     for stream in tracks.streams:
         origin = origins.get(id(stream))
         if origin is None or origin.inline_manifest or origin.json_manifest is not None:
             return ()
         url = str(origin.manifest_url or "")
+        metadata = _playback_metadata(origin)
+        if url in labels and labels[url] != metadata:
+            return ()  # Identical URLs may belong to independently authorized profiles.
+        labels[url] = metadata
         if urlsplit(url).scheme not in {"http", "https"}:
             return ()
         if (
@@ -540,7 +653,7 @@ def entry_for(
     merge_manifests = bool(alternate_manifest_urls)
     if tracks is not None:
         chosen = {id(stream) for stream in (tracks.selected or [])}
-        for stream in tracks.streams:
+        for stream in [*tracks.streams, *getattr(tracks, "sidecars", [])]:
             mark = TAKEN if id(stream) in chosen else LEFT
             rows.append(f"{mark} {stream.format_line()}")
         summary = tracks.summary()
@@ -553,6 +666,15 @@ def entry_for(
             alternate_manifest_urls = tuple(alternate_urls)
             merge_manifests = bool(alternate_manifest_urls)
             json_manifest = None
+            origins = [playback, *getattr(tracks, "origins", {}).values()]
+            records = [
+                {"type": "reference", "url": url,
+                 "metadata": next((_playback_metadata(origin) for origin in origins if origin.manifest_url == url), {})}
+                for url in master_urls
+            ]
+            if any(set(record["metadata"]) - {"url"} for record in records):
+                json_manifest = source_bundle(records)
+                manifest_url, alternate_manifest_urls, merge_manifests = "", (), False
         elif getattr(source, "json_document", None) is not None:
             # A multi-profile ladder is represented by the native backend as one
             # synthetic typed JSON manifest. Export that runnable source rather
@@ -580,6 +702,15 @@ def entry_for(
         manifest_url = ""
         alternate_manifest_urls = ()
         merge_manifests = False
+    subtitles = _subtitle_sources(playback, tracks)
+    if subtitles:
+        if json_manifest is None:
+            json_manifest = source_bundle([
+                {"type": "reference", "url": url, "metadata": _playback_metadata(playback)}
+                for url in dict.fromkeys((manifest_url, *alternate_manifest_urls)) if url
+            ])
+        json_manifest = with_subtitle_sources(json_manifest, subtitles)
+        manifest_url, alternate_manifest_urls, merge_manifests = "", (), False
     return Entry(
         save_name=playback.save_name,
         title=playback.title,
@@ -592,6 +723,8 @@ def entry_for(
         proxy=_text(playback.proxy),
         is_live=bool(playback.is_live),
         note=_text(playback.note),
+        requested=_text(playback.requested),
+        returned=_text(playback.returned),
         drm_system=_text(drm.system) if drm is not None else "",
         pssh=_text(drm.pssh) if drm is not None else "",
         wrm_header=_text(drm.wrm_header) if drm is not None else "",
@@ -684,6 +817,8 @@ def loads(text: str) -> Document:
             if entry.json_manifest is not None:
                 try:
                     source_manifest(entry.json_manifest)
+                    if BUNDLE_MARKER in entry.json_manifest:
+                        validate_bundle(entry.json_manifest)
                 except ManifestSourceError as exc:
                     raise ExportError(str(exc)) from exc
     return document

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import math
+import os
 import re
 import shutil
 import subprocess
@@ -10,11 +12,36 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 
 from .cenc_fragment import CencInitMetadata, CencProgressCallback, decrypt_cenc_fragment, load_cenc_init_metadata
-from .embedding import managed_run
+from .embedding import DownloadRuntime, current_download_runtime, managed_popen, managed_run
 from .subtitles import SubtitleConversionError, convert_subtitle_file
 from .utils import WINDOWS_INTERMEDIATE_PATH_LIMIT, bounded_path, looks_like_h266, safe_temp_root
 
 DecryptEventCallback = Callable[[str], None]
+
+
+@dataclass(frozen=True, slots=True)
+class FFmpegProgress:
+    processed_seconds: float = 0.0
+    duration_seconds: float | None = None
+    speed: float | None = None
+    finalizing: bool = False
+    finished: bool = False
+
+    @property
+    def percent(self) -> float | None:
+        if self.duration_seconds is None:
+            return None
+        if self.finished:
+            return 100.0
+        # An end marker can precede a failed trailer write. Only a successful
+        # process exit may publish completion.
+        return min(99.9, 100 * self.processed_seconds / self.duration_seconds)
+
+    @property
+    def eta_seconds(self) -> float | None:
+        if self.duration_seconds is None or self.speed is None:
+            return None
+        return max(0.0, self.duration_seconds - self.processed_seconds) / self.speed
 
 
 MEDIA_SUFFIXES = {
@@ -2236,6 +2263,89 @@ def _mkvmerge_track_type(media_type: object) -> str | None:
     if normalized in {"video", "audio", "subtitles"}:
         return normalized
     return None
+
+
+def _positive_number(value: object) -> float | None:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) and number > 0 else None
+
+
+def _run_ffmpeg_progress(
+    args: list[str],
+    action: str,
+    duration_seconds: float | None,
+    callback: Callable[[FFmpegProgress], None],
+) -> None:
+    """Stream machine-readable progress without buffering FFmpeg's diagnostics.
+
+    Keep the normal command, decoder and encoder options intact. The runtime
+    still owns cancellation; a temporary stderr file avoids pipe deadlocks
+    and bounds the amount of diagnostic text retained in memory.
+    """
+    command = [args[0], "-nostats", "-progress", "pipe:1", *args[1:]]
+    runtime = current_download_runtime()
+    duration = _positive_number(duration_seconds)
+    update = FFmpegProgress(duration_seconds=duration)
+    callback(update)
+    with tempfile.TemporaryFile() as diagnostics:
+        process = managed_popen(
+            command, stdout=subprocess.PIPE, stderr=diagnostics,
+            text=True, encoding="utf-8", errors="replace",
+        )
+        try:
+            fields: dict[str, str] = {}
+            assert process.stdout is not None
+            for line in process.stdout:
+                if runtime is not None:
+                    runtime.checkpoint()
+                name, separator, value = line.strip().partition("=")
+                if not separator:
+                    continue
+                # Ignore unrecognised fields instead of accumulating arbitrary
+                # stdout from a misconfigured binary.
+                if name in {"out_time_us", "out_time_ms", "out_time", "speed"}:
+                    fields[name] = value
+                if name != "progress":
+                    continue
+                microseconds = _positive_number(fields.get("out_time_us") or fields.get("out_time_ms"))
+                seconds = microseconds / 1_000_000 if microseconds is not None else 0.0
+                if not seconds and fields.get("out_time"):
+                    try:
+                        hours, minutes, secs = fields["out_time"].split(":")
+                        seconds = float(hours) * 3600 + float(minutes) * 60 + float(secs)
+                    except (ValueError, OverflowError):
+                        seconds = 0.0
+                if not math.isfinite(seconds):
+                    seconds = 0.0
+                update = FFmpegProgress(
+                    processed_seconds=max(update.processed_seconds, seconds),
+                    duration_seconds=duration,
+                    speed=_positive_number(fields.get("speed", "").removesuffix("x")),
+                    finalizing=value == "end",
+                )
+                callback(update)
+                fields.clear()
+            returncode = process.wait()
+            if runtime is not None:
+                runtime.checkpoint()
+            if returncode:
+                diagnostics.seek(0, os.SEEK_END)
+                diagnostics.seek(max(0, diagnostics.tell() - 64 * 1024))
+                details = _command_details(diagnostics.read().decode("utf-8", errors="replace"))
+                suffix = f": {details}" if details else ""
+                raise RuntimeError(f"{action} command failed with status {returncode}{suffix}")
+            callback(replace(update, finished=True))
+        finally:
+            if process.poll() is None:
+                DownloadRuntime._terminate_process(process, runtime is not None and os.name == "posix")
+                process.wait()
+            if process.stdout is not None:
+                process.stdout.close()
+            if runtime is not None:
+                runtime.unregister_process(process)
 
 
 def _run_external(args: list[str], action: str) -> None:

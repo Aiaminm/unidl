@@ -18,17 +18,68 @@ class ManifestSourceError(ValueError):
     pass
 
 
+def source_metadata(value: Mapping[str, Any]) -> dict[str, str]:
+    """Only public provenance, never provider responses or licence context."""
+    return {
+        key: value[key] for key in ("url", "requested", "returned", "note", "profile", "kind", "api")
+        if isinstance(value.get(key), str) and value[key]
+    }
+
+
+def merge_source_metadata(*inventories) -> list[dict[str, str]]:
+    result: list[dict[str, str]] = []
+    for inventory in inventories:
+        for value in inventory or ():
+            if isinstance(value, Mapping):
+                item = source_metadata(value)
+                if item and item not in result:
+                    result.append(item)
+    return result
+
+
+def subtitle_source_identity(value: Mapping[str, Any]) -> str:
+    """Selection/name/provenance do not change the underlying subtitle source."""
+    return json.dumps({
+        "url": value["url"], "language": value.get("language") or "und",
+        "kind": value.get("kind") or "normal", "format": value.get("format") or "",
+        "headers": {key.casefold(): item for key, item in (value.get("headers") or {}).items()},
+    }, sort_keys=True)
+
+
+def with_subtitle_sources(document: Mapping[str, Any], subtitles: list[dict[str, Any]]) -> dict[str, Any]:
+    """Keep independent API subtitle URLs alongside, not inside, MPD/HLS state."""
+    if not subtitles:
+        return dict(document)
+    result = (
+        dict(document) if BUNDLE_MARKER in document
+        else source_bundle([{"type": "json", "document": source_manifest(document)}], mode="collection")
+    )
+    validate_bundle({**result, "subtitle_sources": subtitles})
+    rows: dict[str, dict[str, Any]] = {}
+    for item in [*result.get("subtitle_sources", []), *subtitles]:
+        identity = subtitle_source_identity(item)
+        previous = rows.get(identity)
+        if previous is not None:
+            item = {**item, "sources": merge_source_metadata(previous.get("sources"), item.get("sources"))}
+        rows[identity] = item
+    result["subtitle_sources"] = list(rows.values())
+    validate_bundle(result)
+    return result
+
+
 def source_request_headers(extra: Mapping[str, Any], current: dict[str, str] | None = None) -> dict[str, str] | None:
     """Carry a saved source's request context through native download/hydration."""
     saved = extra.get("_unidl_source_headers")
-    if not saved:
+    scoped = extra.get("_unidl_subtitle_headers")
+    if not saved and not scoped:
         return current
-    result = dict(saved)
-    for name, value in (current or {}).items():
-        for old in list(result):
-            if old.casefold() == name.casefold():
-                del result[old]
-        result[name] = value
+    result = dict(saved or {})
+    for headers in (current, scoped):
+        for name, value in (headers or {}).items():
+            for old in list(result):
+                if old.casefold() == name.casefold():
+                    del result[old]
+            result[name] = value
     return result
 
 
@@ -163,6 +214,28 @@ def validate_bundle(document: Mapping[str, Any]) -> None:
     tracks = document.get("tracks", [])
     if not isinstance(tracks, list) or not all(isinstance(track, dict) for track in tracks):
         raise ManifestSourceError("Invalid source track metadata.")
+    subtitles = document.get("subtitle_sources", [])
+    if not isinstance(subtitles, list):
+        raise ManifestSourceError("Invalid independent subtitle sources.")
+    for subtitle in subtitles:
+        if not isinstance(subtitle, dict) or not isinstance(subtitle.get("url"), str) or not subtitle["url"].strip():
+            raise ManifestSourceError("An independent subtitle source requires a URL.")
+        for key in ("language", "kind", "name", "format"):
+            if key in subtitle and not isinstance(subtitle[key], str):
+                raise ManifestSourceError("Invalid independent subtitle metadata.")
+        for key in ("original", "selected"):
+            if key in subtitle and type(subtitle[key]) is not bool:
+                raise ManifestSourceError("Invalid independent subtitle flag.")
+        if "headers" in subtitle and (
+            not isinstance(subtitle["headers"], dict)
+            or not all(isinstance(k, str) and isinstance(v, str) for k, v in subtitle["headers"].items())
+        ):
+            raise ManifestSourceError("Invalid independent subtitle request headers.")
+        if "sources" in subtitle and (
+            not isinstance(subtitle["sources"], list)
+            or not all(isinstance(item, dict) and item == source_metadata(item) for item in subtitle["sources"])
+        ):
+            raise ManifestSourceError("Invalid independent subtitle provenance.")
     for record in sources:
         if not isinstance(record, dict) or not isinstance(record.get("type"), str) or record["type"] not in {"reference", "json", "hls", "dash", "ism"}:
             raise ManifestSourceError("Unsupported manifest source type.")
@@ -185,6 +258,10 @@ def validate_bundle(document: Mapping[str, Any]) -> None:
                 raise ManifestSourceError("Invalid manifest source parser policy.")
         if "track" in record and not isinstance(record["track"], dict):
             raise ManifestSourceError("Invalid media playlist track metadata.")
+        if "metadata" in record and (
+            not isinstance(record["metadata"], dict) or record["metadata"] != source_metadata(record["metadata"])
+        ):
+            raise ManifestSourceError("Invalid manifest source provenance.")
         if "session_keys" in record and (
             not isinstance(record["session_keys"], list)
             or not all(isinstance(value, str) and value.startswith("#EXT-X-SESSION-KEY:") for value in record["session_keys"])

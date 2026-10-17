@@ -131,6 +131,25 @@ Language matching accepts exact and primary BCP-47 forms (`es-419` and `es`, for
 example), plus common ISO-639 aliases. Unknown `und` tracks are not guessed as a
 user language unless `und` is explicitly requested.
 
+### Country and region names in track lists
+
+Audio and subtitle rows keep the original language tag and show its explicit
+country or region alongside it: `en-US | United States`, `pt-BR | Brazil`, or
+`zh-Hant-HK | Hong Kong`. Names are displayed in English and come from local
+data; displaying them makes no network requests.
+
+Tags without a region, such as `en`, `und`, or `fil`, do not imply a country.
+When a manifest shortens the language to `en` but retains an explicit locale in
+track metadata such as `en-us_dialog_0`, UniDL can display United States without
+changing the original `en` tag. The fallback accepts only a locale at the start
+of a track identifier/name whose primary language matches the track. Conflicting
+fallback regions are left unlabeled; an explicit region in the language tag
+always takes priority. URLs and free-form country mentions are not inspected.
+`es-419` means Latin America and the Caribbean, not one particular country.
+These names describe the region declared by the track's metadata, not a
+verified recording location. They are display-only: language matching, drop
+filters, mux language metadata, export language tags and filenames stay unchanged.
+
 ## Default audio in the muxed file
 
 **Audio languages** chooses which tracks to download. **Default audio language**

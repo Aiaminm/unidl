@@ -122,7 +122,7 @@ def _styled_progress_text(
         # A save name such as ``Done.100%.mkv`` must not paint an active bar green.
         is_done = bool(
             re.search(
-                r"(?<![A-Za-z0-9_])Done(?=\s*(?:✓)?$)",
+                r"(?<![A-Za-z0-9_])(?:Done|Downloaded|Recorded)(?=\s*(?:✓)?$)",
                 clean,
             )
         )
@@ -447,6 +447,9 @@ class DownloadScreen(AskHost):
         if not found:
             return
         panel = found.first(Static)
+        # The audio preview can take almost half the screen. Give Core the
+        # progress panel's actual width rather than the whole terminal width.
+        self.controller.update_frame_columns(panel.size.width or self.size.width)
         if not rows:
             panel.display = False
             panel.update("", layout=True)
@@ -815,7 +818,9 @@ class DownloadScreen(AskHost):
         """An active ask owns the space, including after resize/probe refreshes."""
         asking = self._current_ask is not None
         show_details = self._described is not None
-        show_audio = bool(self._described and self._described.audio_only)
+        # Artwork is secondary to active work. A fixed-width preview otherwise
+        # leaves only ~25 cells for conversion status in an 80-column terminal.
+        show_audio = bool(self._described and self._described.audio_only and self.size.width >= 112)
         if asking:
             # AskHost restores these when the answer is submitted. Remember the
             # latest description, not the visibility from before the refresh.

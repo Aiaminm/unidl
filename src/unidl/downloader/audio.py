@@ -8,13 +8,14 @@ import subprocess
 import sys
 import tempfile
 import threading
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 from urllib.parse import unquote, urljoin, urlparse
 
 from .embedding import managed_run
 from .loader import LoadError, load_bytes
-from .postprocess import _run_external
+from .postprocess import FFmpegProgress, _run_external, _run_ffmpeg_progress
 from .utils import WINDOWS_INTERMEDIATE_PATH_LIMIT, bounded_path, safe_temp_root, unique_path
 
 ID3_METADATA_FIELDS = (
@@ -196,6 +197,9 @@ def transcode_audio(
     cover_path: str | Path | None = None,
     chapters_file: str | Path | None = None,
     copy_audio: bool = False,
+    *,
+    duration_seconds: float | None = None,
+    progress_callback: Callable[[FFmpegProgress], None] | None = None,
 ) -> Path:
     target_format = str(output_format or "").strip().lower()
     if target_format not in {"mp3", "flac", "alac", "m4a"}:
@@ -285,7 +289,10 @@ def transcode_audio(
             "alac": "ALAC audio conversion",
             "m4a": "M4A audio remux",
         }
-        _run_external(args, labels[target_format])
+        if progress_callback is None:
+            _run_external(args, labels[target_format])
+        else:
+            _run_ffmpeg_progress(args, labels[target_format], duration_seconds, progress_callback)
         return output
     finally:
         if chapter_temp_dir is not None:

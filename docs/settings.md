@@ -52,6 +52,16 @@ Import expands the saved protocol documents through the normal parsers, without
 requesting the original master again. A direct media URL or an original JSON
 track list remains a source reference; export does not download the media.
 
+Both modes preserve independent API subtitle URLs, including unselected
+languages, Normal/SDH/Forced kinds, format, original-language flags and required
+request headers. Multiple authorized profiles retain their individual request
+and returned-type labels and track associations, even when duplicate tracks
+collapse to one picker row. Source labels and subtitle URLs are not the large
+playback/API envelopes: those and expanded JSON segment lists remain excluded.
+On import, an installed service keeps its custom sidecar hooks; without it,
+direct subtitle sources use generic delivery. Expired or missing URLs cannot be
+recovered from labels alone; recreate an older export if it omitted them.
+
 The export choice is a third setting boundary, separate from both provider
 manifest profile and final track selection. Media export records every parsed
 track, not only the tracks selected for that run; the imported title can therefore

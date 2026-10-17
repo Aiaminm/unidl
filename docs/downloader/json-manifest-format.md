@@ -253,6 +253,43 @@ numbers and optional `duration`. `collection` preserves independent playlists
 without deduplicating distinct renditions. Optional root `tracks` rows preserve
 descriptive corrections and original/default flags; they are not media sources.
 
+### Profile provenance and independent API subtitles
+
+Each source may include a small `metadata` object with public `requested`,
+`returned`, `profile`, `kind`, `api`, `note` and original source `url` strings.
+Only fields actually supplied are retained; UniDL does not infer profile names
+from a URL or save the provider's response/client/licence context. Descriptive
+track rows retain their source association and native JSON `profile`/`kind`
+labels. When identical tracks from several profiles are deduplicated, all their
+source labels survive. No authorization request is repeated on import.
+
+Subtitles advertised outside an MPD/HLS document are executable sources in the
+root `subtitle_sources` list, not just human-readable rows:
+
+```json
+{
+  "url": "https://subtitles.example/en-sdh.vtt",
+  "language": "en",
+  "kind": "sdh",
+  "format": "vtt",
+  "name": "English SDH",
+  "original": true,
+  "selected": false,
+  "headers": {"Referer": "https://provider.example/"},
+  "sources": [{"requested": "HEVC HDR", "returned": "HEVC SDR"}]
+}
+```
+
+All available subtitle languages and kinds are retained, including unselected
+ones, from successfully parsed authorized variants. Request headers are optional;
+only explicit subtitle-specific overrides outrank refreshed common headers.
+Import without a service exposes these URLs as clear subtitle tracks in the
+normal picker and downloads only those selected. An installed service may
+reclaim matching rows through `augment_tracks()` and continue using its custom
+`prepare_download()` conversion/mux path without creating duplicate tracks.
+Neither this metadata nor the subtitle sources contain a JSON segment list.
+Re-export updates selection flags without duplicating the underlying source.
+
 Neither JSON `segments` arrays nor compact segment tables may appear in newly
 written source documents. Raw playlists/MPDs naturally retain their own protocol
 segment syntax; parsers expand that syntax only at runtime. Resume checkpoints

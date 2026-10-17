@@ -40,9 +40,12 @@ from ..core.manifest_sources import (
     BUNDLE_MARKER,
     ManifestSourceError,
     manifest_json,
+    merge_source_metadata,
     source_bundle,
     source_manifest,
+    source_metadata,
     validate_bundle,
+    with_subtitle_sources,
 )
 from ..core.secureio import (
     atomic_write_text,
@@ -138,6 +141,14 @@ class NativeDownloaderBackend:
         callers use :meth:`parse`; both paths produce the same manifest shape.
         """
         state = tuple(streams)
+        metadata = source_metadata({
+            **request.metadata,
+            "url": request.source.reference or request.policy.base_url or "",
+        })
+        if request.metadata:
+            for stream in state:
+                if not stream.extra.get("source_metadata"):
+                    stream.extra["source_metadata"] = [metadata]
         tracks = tuple(
             self._describe(stream, index)
             for index, stream in enumerate(state, start=1)
@@ -203,6 +214,7 @@ class NativeDownloaderBackend:
                     "parser policy before their tracks can be merged"
                 )
         all_streams: list[StreamInfo] = []
+        by_fingerprint: dict[tuple[object, ...], StreamInfo] = {}
         seen: set[tuple[object, ...]] = set()
         for manifest in manifests:
             for stream in self.streams(manifest):
@@ -243,8 +255,13 @@ class NativeDownloaderBackend:
                     source_identity,
                 )
                 if fingerprint in seen:
+                    existing = by_fingerprint[fingerprint]
+                    existing.extra["source_metadata"] = merge_source_metadata(
+                        existing.extra.get("source_metadata"), stream.extra.get("source_metadata"),
+                    )
                     continue
                 seen.add(fingerprint)
+                by_fingerprint[fingerprint] = stream
                 all_streams.append(stream)
         if not all_streams:
             # Keep the source shape valid even when a candidate was an empty
@@ -335,6 +352,10 @@ class NativeDownloaderBackend:
             record = {"type": "json", "document": source_manifest(source.json_document)}
         if policy.headers:
             record["headers"] = dict(policy.headers)
+        if request.metadata:
+            record["metadata"] = source_metadata({
+                "url": source.reference or policy.base_url or "", **request.metadata,
+            })
         if policy.base_url:
             record["base_url"] = policy.base_url
         record["details"] = policy.details and not policy.no_child_playlists
@@ -374,10 +395,12 @@ class NativeDownloaderBackend:
             nested = []
             for child in document["sources"]:
                 nested.extend(self._media_sources(child, headers, depth=depth + 1))
-            return [{**record, "document": source_bundle(
+            converted = source_bundle(
                 nested, mode=document.get("mode", "merge"),
                 duration=document.get("duration", 0), tracks=document.get("tracks"),
-            )}]
+            )
+            converted = with_subtitle_sources(converted, document.get("subtitle_sources", []))
+            return [{**record, "document": converted}]
         if kind == "reference":
             if "export_entry" in record:
                 raise ManifestSourceError(
@@ -568,6 +591,8 @@ class NativeDownloaderBackend:
         # Only retain flags consumed by the native formatter; arbitrary service
         # metadata can contain non-JSON objects and is not needed to download.
         for key in (
+            "subtitle_kind",
+            "subtitle_original",
             "audio_atmos",
             "muxed_audio",
             "audio_id",
@@ -590,6 +615,13 @@ class NativeDownloaderBackend:
         ):
             if key in stream.extra:
                 record[key] = stream.extra[key]
+        raw = stream.extra.get("raw")
+        if stream.extra.get("source_metadata"):
+            record["source_metadata"] = merge_source_metadata(stream.extra["source_metadata"])
+        if isinstance(raw, dict):
+            for key in ("profile", "kind", "forced", "sdh", "descriptive"):
+                if isinstance(raw.get(key), (str, bool)):
+                    record[key] = raw[key]
         if stream.media_type == "audio":
             from .mux_audio import original_audio, source_default_audio
 

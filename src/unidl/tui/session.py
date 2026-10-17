@@ -104,7 +104,7 @@ TAKEN, LEFT = "▸", "·"
 
 
 def _track_highlights(stream: object) -> tuple[tuple[str, str], ...]:
-    """Exceptional format badges to colour inside an otherwise neutral row."""
+    """Format and original-language badges inside an otherwise neutral row."""
     highlights: list[tuple[str, str]] = []
 
     def add(term: str, role: str) -> None:
@@ -135,6 +135,11 @@ def _track_highlights(stream: object) -> tuple[tuple[str, str], ...]:
     extra = extra if isinstance(extra, dict) else {}
     format_line = getattr(stream, "format_line", None)
     line = str(format_line() if callable(format_line) else "")
+    if (
+        getattr(stream, "media_type", None) in {"audio", "subtitle", "subtitles", "text"}
+        and re.search(r"(?<![A-Za-z0-9_-])Original(?![A-Za-z0-9_-])", line, re.IGNORECASE)
+    ):
+        add("Original", "original")
     audio_text = " ".join(
         str(value or "")
         for value in (
