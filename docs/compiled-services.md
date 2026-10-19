@@ -41,6 +41,12 @@ name so relative imports retain the normal service contract. If none or more
 than one variant matches, the service is isolated and readiness reports the
 reason.
 
+An optional root-manifest boolean, `custom_license = true`, explicitly declares
+the service's existing custom licensing support. It exposes **Custom license**
+in the service's **License action** choice without guessing from extension names
+or overrides. The declaration applies to the selected ABI/platform variant.
+Omit it for services using only the standard Before/After modes.
+
 Register the package from **Settings → Services → Register a service**, restart
 UniDL, and verify it with `unidl services`. A compiled-only package can keep all
 normal service settings, login flows, playback and downloader behaviour because

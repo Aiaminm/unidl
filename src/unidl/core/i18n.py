@@ -19,7 +19,7 @@ from typing import Any
 
 from .terminal_cells import cell_width
 
-SUPPORTED_LOCALES = ("en", "zh-Hans", "zh-Hant", "es", "fr", "pt", "it", "ja", "ko", "ru")
+SUPPORTED_LOCALES = ("en", "zh-Hans", "zh-Hant", "es", "fr", "pt", "it", "ja", "ko", "ru", "de")
 DEFAULT_LOCALE = "en"
 
 #: Known English chrome / key-bar / status phrases → stable message IDs.
@@ -168,6 +168,12 @@ _LOCALE_ALIASES = {
     "en_gb": "en",
     "c": "en",
     "posix": "en",
+    "de": "de",
+    "de-de": "de",
+    "de-at": "de",
+    "de-ch": "de",
+    "de-li": "de",
+    "de-lu": "de",
     "es": "es",
     "es-es": "es",
     "es_es": "es",
@@ -358,6 +364,50 @@ def get_translator() -> Translator:
 
 
 _DYNAMIC_SETTING_PHRASES: dict[str, tuple[tuple[str, str], ...]] = {
+    "de": (
+        ("Auto / best available", "Automatisch / beste verfügbare"),
+        ("Best available", "Beste verfügbare"),
+        ("Manifest profile", "Manifest-Profil"),
+        ("Manifest resolution", "Manifest-Auflösung"),
+        ("Manifest color range", "Manifest-Dynamikumfang"),
+        ("Manifest codec", "Manifest-Codec"),
+        ("Playback source", "Wiedergabequelle"),
+        ("Playback scenario", "Wiedergabeszenario"),
+        ("Authorization method", "Autorisierungsmethode"),
+        ("Sign-in method", "Anmeldemethode"),
+        ("Login method", "Anmeldemethode"),
+        ("Browser cookies", "Browser-Cookies"),
+        ("Apple ID account", "Apple-ID-Konto"),
+        ("full ladder", "alle Qualitätsstufen"),
+        ("Dynamic range", "Dynamikumfang"),
+        ("Source quality", "Quellqualität"),
+        ("Stream quality", "Streamqualität"),
+        ("Video quality", "Videoqualität"),
+        ("Audio quality", "Audioqualität"),
+        ("Video profile", "Videoprofil"),
+        ("Audio profile", "Audioprofil"),
+        ("Metadata language", "Metadatensprache"),
+        ("Catalogue language", "Katalogsprache"),
+        ("Catalog languages", "Katalogsprachen"),
+        ("Live recording length", "Dauer der Live-Aufnahme"),
+        ("Offer the replay window", "Replay-Zeitfenster anbieten"),
+        ("Check remote vaults before licensing", "Remote-Vaults vor der Lizenzanfrage prüfen"),
+        ("Store licensed keys in remote vaults", "Erhaltene Schlüssel in Remote-Vaults speichern"),
+        ("Dolby Vision + HDR10 hybrid output", "Dolby Vision + HDR10 Hybridausgabe"),
+        ("Netflix video codec profile", "Netflix-Videocodec-Profil"),
+        ("Netflix video quality profile", "Netflix-Videoqualitätsprofil"),
+        ("best available", "beste verfügbare"),
+        ("Automatic", "Automatisch"), ("Auto", "Automatisch"),
+        ("Playback", "Wiedergabe"), ("Manifest", "Manifest"),
+        ("Source", "Quelle"), ("Stream", "Stream"), ("Profile", "Profil"),
+        ("Quality", "Qualität"), ("Resolution", "Auflösung"), ("Codec", "Codec"),
+        ("Language", "Sprache"), ("Region", "Region"), ("Country", "Land"),
+        ("Account", "Konto"), ("Device", "Gerät"), ("Live", "Live"),
+        ("Market", "Markt"), ("Delivery", "Übertragung"),
+        ("Requested", "Angefordert"), ("Prefer", "Bevorzugen"),
+        ("Ask", "Nachfragen"), ("Any", "Beliebig"), ("Main", "Haupt"),
+        ("Primary", "Primär"), ("Video", "Video"), ("Audio", "Audio"),
+    ),
     "zh-Hans": (
         ("Auto / best available", "自动 / 最高可用"),
         ("Best available", "最高可用"),

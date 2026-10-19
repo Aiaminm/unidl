@@ -28,6 +28,7 @@ OPEN_SOURCE_PROJECTS = (
     ("python-bidi", "bidirectional text layout", "LGPL-3.0", "https://github.com/MeirKriheli/python-bidi"),
     ("qrcode", "terminal QR support", "BSD", "https://github.com/lincolnloop/python-qrcode"),
     ("geonamescache", "country and region names", "MIT", "https://github.com/yaph/geonamescache"),
+    ("pycountry", "ISO language names", "LGPL-2.1-only", "https://github.com/pycountry/pycountry"),
     ("FFmpeg", "media conversion and muxing", "LGPL/GPL build dependent", "https://ffmpeg.org/"),
     (
         "N_m3u8DL-RE",

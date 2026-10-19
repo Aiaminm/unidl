@@ -65,6 +65,7 @@ from ..core.partner import (
 )
 from ..core.playback import LiveWindow, Playback, normalize_live_record_limit
 from ..core.service import Service
+from ..core.settings import license_action
 from ..core.title_delay import parse_title_delay, sample_title_delay
 from ..core.titles import Title
 from ..core.vault import normalize_hex, split_pair
@@ -2575,12 +2576,14 @@ class SessionController:
             self.post_status("")
             return DONE, "tracks listed"
 
-        # The normal path licenses the complete parsed inventory before output
-        # selection.  A deliberately opt-in per-service compatibility setting defers it to
-        # the confirmed output tracks; this is useful for HLS services whose PSSH
-        # only appears in selected media playlists.  It is not the meaning of
-        # Track output selection and never changes the default behavior.
-        defer_license = bool(self.settings.get("license_after_tracks", False))
+        # Timing is explicit: Before uses the pre-selection inventory, After
+        # waits for final encrypted tracks, and a declared Custom service owns
+        # its plan (including whether that plan needs the final picker).
+        action = license_action(self.settings, self.service)
+        custom_defer = getattr(self.service, "custom_license_after_tracks", None)
+        defer_license = action == "after" or (
+            action == "custom" and callable(custom_defer) and custom_defer(playback)
+        )
         if not defer_license:
             try:
                 self.post_status(tr("delivery.status.resolving_keys"))
@@ -2721,7 +2724,7 @@ class SessionController:
                     self.service,
                     tracks,
                     self.settings,
-                    license_tracks=selected_inventory,
+                    license_tracks=selected_inventory if action == "after" else None,
                 )
                 self._require_content_keys(playback, selected_inventory)
             except Exception as exc:
@@ -2792,7 +2795,7 @@ class SessionController:
                                 self.service,
                                 tracks,
                                 self.settings,
-                                license_tracks=selected_inventory,
+                                license_tracks=selected_inventory if action == "after" else None,
                             )
                             self._require_content_keys(playback, selected_inventory)
                         except Exception as exc:

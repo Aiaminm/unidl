@@ -342,6 +342,8 @@ class Service:
     #: Service ids used before a rename.  They remain lookup aliases and are
     #: consulted only for reading existing state/configuration.
     LEGACY_IDS: tuple[str, ...] = ()
+    #: Explicit opt-in: expose Custom license and keep service-owned planning.
+    CUSTOM_LICENSE: bool = False
     #: The short uppercase service tag unshackle uses - PMPT, DSNP, AMZN. Left
     #: empty means "derive one", so a service does not have to invent a tag, but
     #: setting it explicitly is how the real one gets recorded.
@@ -531,7 +533,7 @@ class Service:
             specs += [spec for spec in live_settings() if spec.key not in declared]
         declared = {s.key for s in specs}
         specs += [
-            spec for spec in service_license_settings(config)
+            spec for spec in service_license_settings(config, custom_license=cls.CUSTOM_LICENSE)
             if spec.key not in declared
         ]
         declared = {s.key for s in specs}
@@ -1153,25 +1155,32 @@ class Service:
     def _did_anything(flow: Iterator[Ask]) -> Iterator[Ask]:
         """Pass a sub-flow through, and return whether it produced anything.
 
-        ``yield from`` would be shorter and cannot count. The answers have to be
-        forwarded by hand - a sub-flow that never receives what its asks were
-        answered with is a sub-flow that asks the same question for ever.
+        Preserve delegation semantics while counting: answers and exceptions
+        must reach the active child yield. In particular, Back belongs to the
+        innermost page first, not directly to the enclosing search-input loop.
+        A child that handles Back stays alive; only an unhandled Back unwinds
+        to the parent. Closing the wrapper still closes the child.
 
         "Anything" is one ask or one playback: a service that found something either
         shows a list or hands a title straight over, and one that found nothing does
         neither. That is a proxy rather than a declaration, but it is the only
         question core can ask without seventy services agreeing on a return value.
         """
-        produced = 0
-        answer = None
+        produced = False
         try:
+            ask = next(flow)
             while True:
+                produced = True
                 try:
+                    answer = yield ask
+                except GeneratorExit:
+                    raise
+                except BaseException as exc:
+                    ask = flow.throw(exc)
+                else:
                     ask = flow.send(answer)
-                except StopIteration:
-                    return produced > 0
-                produced += 1
-                answer = yield ask
+        except StopIteration:
+            return produced
         finally:
             flow.close()
 
@@ -1320,12 +1329,19 @@ class Service:
 
         ``tracks`` is Core's encrypted licence inventory: the full parsed ladder
         by default, or the selected encrypted tracks when the user explicitly
-        enabled post-selection compatibility mode. The hook must not read shared
+        chose After mode. For a declared Custom service this hook runs only in
+        Custom mode; its final output objects are available in
+        `drm.context["license_final_tracks"]` when deferred. The hook must not read shared
         output settings itself. It selects init data only; Core still owns the CDM
         and every network licence exchange still goes through this service's
         ``get_license``.
         """
         del playback, tracks, log
+
+    def custom_license_after_tracks(self, playback: Playback) -> bool:
+        """A Custom license service may explicitly defer its own plan."""
+        del playback
+        return False
 
     def prepare_download(self, playback: Playback, log: Callable[[str], None]) -> None:
         """Materialize service-owned sidecars immediately before downloading.

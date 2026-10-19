@@ -90,7 +90,7 @@ not every height in the manifest.
 
 Audio filters are combined with **AND**:
 
-- `audio_langs` — comma-separated BCP-47/ISO tags;
+- `audio_langs` — comma-separated BCP-47/ISO tags and/or `original`;
 - `audio_codec` — codec only, including AAC, AC-3, E-AC-3, **AC-4**, Opus,
   FLAC, ALAC and MP3;
 - `audio_profile` — role or feature, such as Atmos, main, commentary,
@@ -131,12 +131,82 @@ Language matching accepts exact and primary BCP-47 forms (`es-419` and `es`, for
 example), plus common ISO-639 aliases. Unknown `und` tracks are not guessed as a
 user language unless `und` is explicitly requested.
 
-### Country and region names in track lists
+### Selecting original audio and subtitles
 
-Audio and subtitle rows keep the original language tag and show its explicit
-country or region alongside it: `en-US | United States`, `pt-BR | Brazil`, or
-`zh-Hant-HK | Hong Kong`. Names are displayed in English and come from local
-data; displaying them makes no network requests.
+Both **Audio languages** (`audio_langs`) and **Subtitle languages**
+(`sub_langs`) accept `original`, alone or mixed with language tags:
+
+| Value | Eligible tracks |
+| --- | --- |
+| `original` | Only tracks explicitly marked Original by the provider/service. |
+| `original,en` | Include original tracks **and** English tracks. If the original language is English, Best selects that language group only once. |
+| `en,de,it` | Include English, German **and** Italian tracks, not just the first matching language. |
+
+Comma-separated entries are additive, not an ordered fallback list. For example,
+if the original language is Japanese, `original,en` selects Japanese original
+tracks and English tracks together. If it is English, the overlapping request
+does not create a second English selection. Reordering the entries does not
+exclude any requested language.
+
+The token is case-insensitive. It reuses UniDL's original-track markers, including
+explicit flags, Original roles and declared original-language metadata. It does
+not infer the original language from a title's country, interface language, track
+order or source-default flag. A track can be marked original even when its
+language tag is `und`.
+
+Language/original matching combines all requested groups within this one field;
+it never stops after the first matching group. All other filters
+still apply with **AND**: original audio must also satisfy the codec, profile and
+channel settings; original subtitles must also satisfy the subtitle-kind filter.
+Quality ranking runs only after those constraints.
+
+Best selects one eligible track per language group; original tracks in different
+languages retain separate groups. If an original track also matches an explicit
+language in the list, that language group is ranked once, not once per token.
+All matching retains every eligible rendition. For example, `original,en` does
+not add a second, lower-ranked English rendition merely because it is original.
+
+If no original marker is available, `original` matches nothing; UniDL does not
+silently select every language. A mixed list such as `original,en` can still
+match English even without original markers: it is a union, not a requirement
+that each token find a track. If the complete rule has no match, normal
+unmatched-selection handling leaves that media type unchecked for manual repair
+in the picker; automatic batches use the existing skip/report behavior.
+
+Example: download original audio and English subtitles, also retaining original
+subtitles when available:
+
+```yaml
+audio_langs: original
+audio_selection: best
+sub_langs: original,en
+subtitle_kinds: normal,forced
+subtitle_selection: best
+```
+
+For subtitle-only batch downloads, combine `output_scope: subtitle` with
+`sub_langs: original`. Separate API/sidecar subtitles and native imported
+manifests use the same rule, provided they carry the original markers.
+
+The CLI equivalents are `--audio-lang original` and
+`--sub-lang original,en`; filter expressions also accept
+`--select-audio lang=original:for=best` and
+`--select-subtitle lang=original,en:for=best`.
+
+These are **download selection** rules. `default_audio=original` and
+`default_subtitle=original` remain separate: they only choose a default playback
+flag among tracks already selected and do not request original tracks.
+
+### Language, country and region names in track lists
+
+Audio and subtitle rows keep the original language tag and add its full English
+language name: `fr | French`, `it | Italian`, or `nl | Dutch`. If a country or
+region is explicitly declared, it follows in parentheses:
+`en-US | English (United States)`, `es-ES | Spanish (Spain)`, or
+`pt-BR | Portuguese (Brazil)`.
+Names come from local ISO-639 and country data; displaying them makes no network
+requests. Two-letter, three-letter and bibliographic ISO language aliases are
+recognized. Unrecognized tags are kept as provided rather than assigned a name.
 
 Tags without a region, such as `en`, `und`, or `fil`, do not imply a country.
 When a manifest shortens the language to `en` but retains an explicit locale in
@@ -145,7 +215,9 @@ changing the original `en` tag. The fallback accepts only a locale at the start
 of a track identifier/name whose primary language matches the track. Conflicting
 fallback regions are left unlabeled; an explicit region in the language tag
 always takes priority. URLs and free-form country mentions are not inspected.
-`es-419` means Latin America and the Caribbean, not one particular country.
+`es-419` displays Spanish (Latin America and the Caribbean), not one particular
+country. A provider label identical to the computed language label is not
+repeated, while role-specific names such as English SDH are preserved.
 These names describe the region declared by the track's metadata, not a
 verified recording location. They are display-only: language matching, drop
 filters, mux language metadata, export language tags and filenames stay unchanged.
@@ -212,7 +284,9 @@ settings may override it.
 
 ## Subtitle selection
 
-`sub_langs` selects the final subtitle languages. `subtitle_kinds` is a
+`sub_langs` selects the final subtitle languages; it accepts language tags,
+`original`, or a mixture such as `original,en`, as described above.
+`subtitle_kinds` is a
 comma-separated filter containing `normal`, `forced`, `sdh`, `commentary`,
 `audio_description`, or `all`.
 

@@ -51,6 +51,16 @@ their own top menu; the default puts them on screen 3.
 Settings and Search are overlays on top of whichever screen is current, not
 screens in this sequence.
 
+### Back always returns one logical page
+
+Back reveals the immediate previous page, not automatically service home.
+Results, seasons, episodes and source choices can share one FlowScreen and must
+still unwind individually. Success, failure, saved commands and exports keep
+the same return target; an overlay closes only itself. Existing service-owned
+navigation must not gain a second Back transition from a Core wrapper.
+The full flow, batch and error-handling contract is in
+[navigation.md](navigation.md).
+
 ### Returning from a saved result
 
 Saved download commands, export files and track-only results remain on the flow

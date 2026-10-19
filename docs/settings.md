@@ -10,8 +10,8 @@ Changes persist immediately and apply to the next request without a restart.
 
 ## Services and homepage visibility
 
-Global Settings → **Services** contains the global **License after final track
-selection** default, **Chapter metadata by service**,
+Global Settings → **Services** contains the global **License action**
+default, **Chapter metadata by service**,
 **Title attachments by service**, **Actual video bitrate by service**,
 **Register a service**, **Services shown on home**, and **Export manifest type**.
 UniDL discovers service packages from the active package directory, the source
@@ -203,7 +203,7 @@ heartbeat interval is part of the shared settings contract.
 | `drm_system` | registered DRM systems | first registered system | Compatibility key controlled by **DRM & vaults → DRM system**. A service that declares exactly one system pins that system; a multi-system service may expose its own override. |
 | `cdm_rules` | resolution-to-device rules | empty | Compatibility key controlled by **DRM & vaults → CDM rules**. Rules choose the app-wide CDM by output resolution and never replace a service's own CDM setting. |
 | `theme` | `dark` / `light` | `dark` | Compatibility key controlled by **Interface & diagnostics**. Also switch with `ctrl+t`; changes repaint the current screen immediately. |
-| `interface_locale` | `system` / `en` / `zh-Hans` / `zh-Hant` / `es` / `fr` / `pt` / `it` / `ja` / `ko` / `ru` | `system` | Compatibility key controlled by **Interface & diagnostics**. Language of UniDL's own labels and settings. Service names, titles, URLs and API locales are not translated. |
+| `interface_locale` | `system` / `en` / `zh-Hans` / `zh-Hant` / `es` / `fr` / `pt` / `it` / `ja` / `ko` / `ru` / `de` | `system` | Compatibility key controlled by **Interface & diagnostics**. Language of UniDL's own labels and settings. German is shown as Deutsch. Service names, titles, URLs and API locales are not translated. |
 | `local_vault` | on / off | on | Global **DRM & vaults → Vault policy** value, inherited by each service until explicitly overridden under **License and vaults**. It governs automatic local lookup; it is not a duplicate backend-enable switch. |
 | `remote_vault` | on / off | off | Global **DRM & vaults → Vault policy** value, inherited by each service until explicitly overridden. It remains the master network/write safety gate for remote-vault operations. |
 | `remote_vault_home_search` | on / off | on | Compatibility key controlled by **Vault policy → Remote operations**. Offers an explicit remote KID search row on the Home/search screen; it never searches while typing and requires a selected searchable backend. This explicit action is independent from the automatic playback/write `remote_vault` gate. |
@@ -214,7 +214,7 @@ heartbeat interval is part of the shared settings contract.
 | `vault_search_targets` | multi-select search-capable vaults | local vaults | Compatibility key controlled by **Vault policy → Home-screen key search**. Remote search remains explicit from the search result. |
 | `vault_write_targets` | multi-select writable vaults | all writable | Global **Store acquired keys** destinations inherited by services until overridden. `no_push` backends are omitted. |
 | `live_record` | on / off | **off** | Compatibility key controlled by **Download behavior**. In the TUI this preselects the record-vs-command question asked after final track selection; headless runs use it directly. A recording then uses the service's `live_record_limit` default unless the user changes it for that run; `00:00:00` means unlimited until stopped. See [live.md](live.md). |
-| `license_after_tracks` | on / off | **off** | Global default under **Settings → Services**. Services inherit it until overridden under **License and vaults**. When enabled, only final selected encrypted tracks' KIDs/PSSH values are resolved; it is not a service API/profile selector. |
+| `license_action` | `before` / `after` / `custom` | **before**, or **custom** for supporting services | Global Before/After default under **Settings → Services**; per-service override under **License and vaults**. Custom appears only for explicitly supporting services. Legacy `license_after_tracks` true/false remains readable as After/Before. See [License action](drm.md#license-action). |
 | `dolby_vision_hybrid` | on / off | **off** | Global default under **Settings → Services**. Services inherit it until overridden under **License and vaults**. For VOD only, a selected HDR10/HDR10+ base is combined with the lowest-resolution available DV layer from the same manifest or merged profile ladder using `dovi_tool`. |
 | `download_dir` | a path | empty | Compatibility key controlled by **Files & naming → Output locations**. Where downloads and live recordings land. Empty uses YAML `paths.downloads` when configured, otherwise `~/unidl_downloads`, grouped by service. No YAML editing is required; `~` is expanded and the folder is created if it does not exist. |
 | `episode_folder_template` | relative template | empty | Compatibility key controlled by **Files & naming → Naming templates**. Adds optional folders below `downloads/<service>/` for episode titles only. Empty preserves the flat layout. Use `{series}`, `{season}`, `{season_number}`, `{year}`, `{season_episode}` and `{service}`; `{series}/{season}` is a typical choice. Movies, live titles and audio remain in the service folder. |
@@ -363,7 +363,7 @@ display the effective value and mark whether it follows global settings or is a
 service override. Explicit off and explicit empty destination selections are
 overrides, not missing values. Opening an editor never saves inherited defaults.
 
-With **License after final track selection** enabled, only the final selected
+With **License action → License after final track selection**, only the final selected
 encrypted tracks contribute KIDs/PSSH values to vault lookup and licensing.
 Unselected manifest renditions are not queried or licensed.
 
@@ -400,12 +400,13 @@ when their defaults happen to match. By default licence acquisition finishes
 before the interactive output picker, so the later output representation is not
 runtime input to a licence request.
 
-The per-service **License after final track selection** compatibility mode is a
-deliberate Core-level exception for inputs whose master manifest does not carry
-the selected media playlists' KIDs/PSSH. It waits for the final checkboxes, then
-uses only those encrypted track objects for vault/licence resolution. It still
-does not let service code read shared quality/language settings to choose a
-provider API request or replace a service's explicit `license_*` policy.
+**License action → After** is the explicit exception: it waits for the final
+picker and hands Core only those encrypted tracks for vault/licence resolution.
+**Before** uses the normal pre-selection inventory. **Custom** lets a supporting
+service choose its own plan and is not offered by undeclared services. This
+does not let services read shared quality/language settings to choose a provider
+API request. See [License action](drm.md#license-action) for precedence,
+compatibility and DASH/HLS/ISM scope.
 
 | Setting | Values | Default |
 |---------|--------|---------|
@@ -613,7 +614,7 @@ self.settings.get("debug")          # global, resolved through the parent scope
 
 One object, three scopes, resolved by fallback. Most service settings shadow a
 global key when a service declares the same name. Shared policy keys
-(`fetch_chapters`, `fetch_actual_bitrate`, `license_after_tracks`, vault gates, and vault target lists)
+(`fetch_chapters`, `fetch_actual_bitrate`, `license_action`, vault gates, and vault target lists)
 instead inherit the global value until a service explicitly saves an override.
 An explicit `false` or empty target list is still an override. Press `r` on an
 inherited service-policy row to remove that override and resume global fallback.

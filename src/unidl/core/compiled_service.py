@@ -158,6 +158,9 @@ def register_compiled_services(
             raise CompiledServiceError(f"compiled service package {package} has no filesystem path")
         manifest_path = Path(locations[0]) / manifest_name
     metadata = _manifest(Path(manifest_path))
+    custom_license = metadata.get("custom_license", False)
+    if not isinstance(custom_license, bool):
+        raise CompiledServiceError("custom_license must be a boolean")
     if str(metadata.get("implementation", "")).strip().lower() != "compiled-only":
         raise CompiledServiceError("service.toml does not declare compiled-only")
     package, selected_manifest, metadata = _variant_manifest(package, Path(manifest_path), metadata)
@@ -244,6 +247,8 @@ def register_compiled_services(
             raise CompiledServiceError("compiled Service identity does not match service.toml")
         if manifest_name_value and service_name != manifest_name_value:
             raise CompiledServiceError("compiled Service name does not match service.toml")
+        if custom_license:
+            candidate.CUSTOM_LICENSE = True
         existing = registry.get(service_id)
         if existing is not None and existing is not candidate:
             raise CompiledServiceError(f"service id {service_id!r} is already registered")

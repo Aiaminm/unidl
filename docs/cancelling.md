@@ -19,6 +19,16 @@ Pause waits at the next segment or live refresh. Back, the first Quit, and skip
 still cancel. The old Stop control cancelled immediately; that is what Pause
 replaced.
 
+## Returning after work stops or finishes
+
+Back returns to the immediate preceding page that launched the current step,
+not directly to service home. Success and failure use the same parent: restore
+the owning picker/input after stopping or dismissing the result. Close a popup
+without also leaving its underlying page. Service home is the destination only
+when it really is that preceding page.
+See [navigation.md](navigation.md) for nested search/season/episode flows,
+custom service delegation and the detailed navigation contract.
+
 ## Failed titles in a batch
 
 A manifest, licence or selected-track preparation failure finishes that title

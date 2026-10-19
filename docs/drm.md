@@ -56,22 +56,45 @@ must not alter the tracks the user finally downloads. This distinction is
 especially important when a service offers several ladders with similar
 resolution labels.
 
-**Settings → Services → License after final track selection** is the global
-default. Services inherit it unless explicitly overridden; pressing `r` on the
-service row restores inheritance. The effective mode waits for the final
-selection and scopes vault lookup and licensing to those encrypted tracks'
-KIDs/PSSH, including init data discovered in media playlists. Unselected
-renditions do not expand that inventory. It does not let service code read shared
-output settings to choose an API or endpoint.
+## License action
 
-For DASH PlayReady in this selected mode, Core maps the final encrypted tracks
-to the MPD's representations and filters their PSSH/PRO/WRM data before licensing.
-Unselected headers already cached in the playback context are excluded too.
-Missing init data is read only from selected initialization segments; Core does
-not fall back to licensing the complete MPD. A shared multi-KID WRM header is
-sent unchanged, but unrelated KIDs do not expand vault coverage or trigger extra
-requests. The same scope applies to local and remote CDMs. With the option off,
-the default full-manifest inventory remains unchanged.
+Choose a global default in **Settings → Services → License action**, or override
+it in a service's **License and vaults** section.
+
+| Action | Timing and scope |
+| --- | --- |
+| License before final track selection | Before the output picker. Widevine normally uses the default/first top-level PSSH; PlayReady collects and deduplicates the full encrypted inventory's headers, including missing init-segment data. |
+| License after final track selection | After automatic/manual final selection. Both Widevine and PlayReady use only selected encrypted tracks, including their media playlists and initialization segments. |
+| Custom license | Offered only when the service explicitly declares support. The service chooses the scope, init data and request organization; it can explicitly defer its plan until after selection. |
+
+The global choice offers Before/After, not Custom. A service declaring Custom
+keeps its own custom default until an explicit global or service policy is saved.
+An explicit service policy takes priority. Press `r` on the service row to clear
+it and restore the explicit global policy, or the service default if none exists.
+Old `license_after_tracks=true/false` settings remain readable as After/Before,
+including explicit false values and renamed service scopes. Saving/resetting the
+new choice removes the obsolete override; opening Settings changes nothing.
+
+After applies to DASH, HLS and ISM. Core maps DASH representations, reads exact
+selected HLS media playlists, and scopes stale full-ladder init data before
+querying vaults or opening a local/remote CDM. It never follows an unselected HLS
+variant just because it was listed first. A selected shared multi-KID header is
+sent unchanged: unrelated returned keys are retained, but do not expand required
+vault coverage or cause extra requests. ISM may declare only one shared
+`ProtectionHeader`; without per-track ownership information Core preserves that
+shared scope rather than inventing a finer mapping.
+
+Widevine After performs independent exchanges for distinct required PSSH values,
+preserving original payloads. Vault-covered requests are skipped; a multi-key
+response can satisfy later objects without another request. Missing selected
+keys are reported as a licensing error. Clear/subtitle-only selections,
+pre-supplied keys, and MonaLisa's local ticket path do not gain new CDM exchanges.
+
+Custom hooks must describe their actual license coverage, not leave an unrelated
+full ladder as the vault requirement. Core uses the custom init plan's KIDs when
+available. Standard Before/After bypass an explicitly declared Custom planner and
+custom resolver, while retaining the service's authenticated license transport.
+Older undeclared hooks retain their compatibility path.
 
 ## PlayReady PSSH and KID handling
 
@@ -107,10 +130,10 @@ contract, not forcing every service into the same request count.
 
 ## Widevine requests
 
-The ordinary Widevine path is one challenge and one service-owned licence call
-for each unresolved request. A service may explicitly require selected-track
-or per-rendition requests; that policy belongs in the service package and must
-be documented in its own setting, not inferred from the shared picker.
+Before normally sends one default Widevine challenge. After may send several
+distinct selected PSSH objects, stopping when the required selected KIDs are
+covered. Custom services own their request plan. Every license call still uses
+the service's authenticated transport; a remote CDM does not replace it.
 
 For live playback, a newly observed KID follows the service's declared init-data
 path. Core reuses a cached key when possible and never invents a second

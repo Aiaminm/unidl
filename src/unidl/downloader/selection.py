@@ -243,7 +243,26 @@ def _filter_language(candidates: list[StreamInfo], value: str | None) -> list[St
     values = _tokens(value)
     if not values:
         return candidates
-    return [stream for stream in candidates if _language_matches(stream.language, values)]
+    languages = [token for token in values if token != "original"]
+    return [
+        stream for stream in candidates
+        if _language_matches(stream.language, languages)
+        or ("original" in values and _original_stream(stream))
+    ]
+
+
+def _original_stream(stream: StreamInfo) -> bool:
+    # Share the provider-marker interpretation with mux defaults. Import lazily:
+    # those modules also use the language/ranking helpers from this module.
+    if stream.media_type == "audio":
+        from .mux_audio import original_audio
+
+        return original_audio(stream)
+    if stream.media_type in {"subtitle", "subtitles", "text"}:
+        from .mux_subtitle import original_subtitle
+
+        return original_subtitle(stream)
+    return False
 
 
 def _filter_video_range(candidates: list[StreamInfo], value: str | None) -> list[StreamInfo]:
@@ -777,8 +796,18 @@ def _language_buckets(candidates: list[StreamInfo], value: str | None) -> list[l
     values = _tokens(value)
     if not values:
         return [candidates] if candidates else []
+    languages = [token for token in values if token != "original"]
     buckets: list[list[StreamInfo]] = []
-    for language in values:
+    for language in dict.fromkeys(values):
+        if language == "original":
+            # An explicit language already covers its original tracks. Rank
+            # that union once, rather than selecting a second, weaker rendition.
+            originals = [
+                stream for stream in candidates
+                if _original_stream(stream) and not _language_matches(stream.language, languages)
+            ]
+            buckets.extend(_language_buckets_by_language(originals))
+            continue
         bucket = [stream for stream in candidates if _language_matches(stream.language, [language])]
         if bucket:
             buckets.append(bucket)

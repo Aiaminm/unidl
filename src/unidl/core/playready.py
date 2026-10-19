@@ -361,6 +361,12 @@ def dash_manifest_for_tracks(
     periods = children(root, "Period") or [root]
     for index, period in enumerate(periods):
         period_id = period.get("id") or str(index)
+        representation_ids = {
+            (candidate.get("id") or "", node.get("id"))
+            for candidate in children(period, "AdaptationSet")
+            for node in children(candidate, "Representation")
+        }
+        period_representation_ids = {value for _, value in representation_ids}
         for adaptation in children(period, "AdaptationSet"):
             representations = children(adaptation, "Representation")
             kept = []
@@ -369,14 +375,18 @@ def dash_manifest_for_tracks(
                 for period_ids, adaptation_id, representation_id, known in inventory:
                     if period_ids and period_id not in period_ids:
                         continue
-                    if known and declared:
-                        matches = bool(known & declared)
-                    else:
+                    identified = (
+                        (adaptation_id, representation_id) in representation_ids
+                        if adaptation_id else representation_id in period_representation_ids
+                    )
+                    if identified:
                         matches = (
                             (not adaptation_id or adaptation_id == adaptation.get("id"))
                             and bool(representation.get("id"))
                             and representation.get("id") == representation_id
                         )
+                    else:
+                        matches = bool(known & declared)
                     if matches:
                         kept.append(representation)
                         break

@@ -290,6 +290,39 @@ def track_region_name(language: str | None, *identifiers: str | None) -> str | N
     return next(iter(regions)) if len(regions) == 1 else None
 
 
+@lru_cache(maxsize=512)
+def language_name(language: str | None) -> str | None:
+    """English ISO-639 name without guessing a regional variant or country."""
+    if not language:
+        return None
+    tag = language.strip().replace("_", "-")
+    if not re.fullmatch(r"[A-Za-z]{2,8}(?:-[A-Za-z0-9]{1,8})*", tag):
+        return None
+    primary = tag.split("-", 1)[0].lower()
+    if len(primary) not in {2, 3}:
+        return None
+    # Imported on first use, so startup and manifest parsing remain independent
+    # of the language-name database. It is local data, never a network lookup.
+    try:
+        import pycountry
+    except ImportError:
+        return None
+    if len(primary) == 2:
+        entry = pycountry.languages.get(alpha_2=primary)
+    else:
+        entry = pycountry.languages.get(alpha_3=primary) or pycountry.languages.get(bibliographic=primary)
+    return getattr(entry, "common_name", None) or getattr(entry, "name", None)
+
+
+def track_language_label(language: str | None, *identifiers: str | None) -> str | None:
+    """Display language (explicit region), separate from the original tag."""
+    name = language_name(language)
+    region = track_region_name(language, *identifiers)
+    if name and region:
+        return f"{name} ({region})"
+    return name or region
+
+
 def format_bitrate(value: int | None) -> str | None:
     if value is None or value <= 0:
         return None

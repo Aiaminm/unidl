@@ -543,7 +543,41 @@ def _vault_target_settings(config: Any = None) -> list[Setting]:
     ]
 
 
-def service_license_settings(config: Any = None) -> list[Setting]:
+def license_action_setting(*, custom: bool = False, visible: bool = True) -> Setting:
+    options = [
+        Option("before", "License before final track selection"),
+        Option("after", "License after final track selection"),
+    ]
+    if custom:
+        options.append(Option("custom", "Custom license"))
+    return Setting(
+        "license_action", "License action", options=options,
+        default="custom" if custom else "before", visible=visible,
+        inherit_global=True,
+        help=(
+            "Before: use the default Widevine PSSH or the full PlayReady inventory. "
+            "After: query vaults and license only final selected encrypted tracks. "
+            "Custom: let the service choose its license plan, when supported."
+        ),
+    )
+
+
+def license_action(settings: Any, service: Any = None) -> str:
+    """Read the new policy while accepting legacy settings/dictionary callers."""
+    default = "custom" if getattr(service, "CUSTOM_LICENSE", False) else "before"
+    value = settings.get("license_action") if settings is not None else None
+    if value is None and settings is not None:
+        old = settings.get("license_after_tracks")
+        if old is not None:
+            enabled = old.strip().lower() in {"true", "yes", "1", "on"} if isinstance(old, str) else bool(old)
+            value = "after" if enabled else "before"
+    action = str(value or default).strip().lower()
+    if action == "custom" and not getattr(service, "CUSTOM_LICENSE", False):
+        return "before"
+    return action if action in {"before", "after", "custom"} else default
+
+
+def service_license_settings(config: Any = None, *, custom_license: bool = False) -> list[Setting]:
     """Per-service metadata, probing, licensing and vault policy settings."""
     targets = _vault_target_settings(config)
     by_key = {spec.key: spec for spec in targets}
@@ -590,7 +624,8 @@ def service_license_settings(config: Any = None) -> list[Setting]:
                 "until this service saves an override."
             ),
         ),
-        Setting("license_after_tracks", "License after final track selection", "bool", default=False,
+        license_action_setting(custom=custom_license),
+        Setting("license_after_tracks", "License after final track selection", "bool", default=False, visible=False,
                 inherit_global=True,
                 help="Wait for this service's final tracks, then query/license only their KIDs and PSSH values."),
         Setting(
@@ -671,6 +706,7 @@ GLOBAL_SETTINGS: list[Setting] = [
         ),
         visible=False,
     ),
+    license_action_setting(visible=False),
     Setting(
         "license_after_tracks",
         "License after final track selection",
@@ -776,6 +812,7 @@ GLOBAL_SETTINGS: list[Setting] = [
             ("ja", "Japanese"),
             ("ko", "Korean"),
             ("ru", "Russian"),
+            ("de", "Deutsch"),
         ],
         "system",
         "Language of UniDL's own labels, prompts and settings. Service names, "
@@ -1355,7 +1392,7 @@ TRACK_SETTINGS: list[Setting] = [
         "Audio languages",
         "text",
         default="",
-        help="Comma separated BCP-47/ISO tags, e.g. en,es-419. Empty = best available language.",
+        help="Comma separated BCP-47/ISO tags or original, e.g. original,en. Original requires an explicit track marker. Empty = best available language.",
     ),
     Setting(
         "default_audio",
@@ -1385,7 +1422,7 @@ TRACK_SETTINGS: list[Setting] = [
         "Subtitle languages",
         "text",
         default="all",
-        help="Comma separated BCP-47/ISO tags, 'all', or empty to skip.",
+        help="Comma separated BCP-47/ISO tags or original, e.g. original,en; 'all', or empty to skip. Original requires an explicit track marker.",
     ),
     Setting(
         "subtitle_kinds",
@@ -1666,6 +1703,23 @@ class Settings:
 
     # ------------------------------------------------------------------ read
     def get(self, key: str, fallback: Any = None) -> Any:
+        if key == "license_action":
+            spec = self.spec_by_key.get(key)
+            for values in [
+                self._overrides,
+                *(self._store.values_for(scope) for scope in (self.service_id, *self.legacy_ids)),
+            ]:
+                if key in values:
+                    return spec.coerce(values[key]) if spec else values[key]
+                if "license_after_tracks" in values:
+                    old = values["license_after_tracks"]
+                    enabled = old.strip().lower() in {"true", "yes", "on", "1"} if isinstance(old, str) else bool(old)
+                    return "after" if enabled else "before"
+            if self.parent is not None and self.parent.has_override(key):
+                return self.parent.get(key, fallback)
+            return spec.default if spec is not None else fallback
+        if key == "license_after_tracks" and "license_action" in self.spec_by_key:
+            return self.get("license_action") == "after"
         if key in self._overrides:
             return self._overrides[key]
         stored = self._store.values_for(self.service_id)
@@ -1715,6 +1769,8 @@ class Settings:
     def set(self, key: str, value: Any, *, persist: bool = True) -> bool:
         """Store a value. Returns True when the change should reset the session."""
         spec = self.spec_by_key.get(key)
+        if key == "license_action":
+            self.clear(key, persist=False)
         coerced = spec.coerce(value) if spec else value
         self._overrides.pop(key, None)
         self._store.put(self.service_id, key, coerced)
@@ -1724,6 +1780,8 @@ class Settings:
 
     def clear(self, key: str, *, persist: bool = True) -> None:
         """Remove a service override so an inheriting setting uses its parent."""
+        if key == "license_action":
+            self.clear("license_after_tracks", persist=False)
         self._overrides.pop(key, None)
         self._store.clear(self.service_id, key)
         # Renamed services must not resurrect an older override on reset.
@@ -1734,6 +1792,8 @@ class Settings:
 
     def has_override(self, key: str) -> bool:
         """Whether this scope explicitly chooses a value, including false/empty."""
+        if key == "license_action" and self.has_override("license_after_tracks"):
+            return True
         return key in self._overrides or any(
             key in self._store.values_for(service_id)
             for service_id in (self.service_id, *self.legacy_ids)

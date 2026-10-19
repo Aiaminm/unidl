@@ -69,7 +69,7 @@ from .manifest_sources import manifest_json, merge_source_metadata, subtitle_sou
 from .output_paths import render_episode_folder
 from .playback import Playback, normalize_live_record_limit
 from .secureio import atomic_write_bytes, atomic_write_text, locked_path, private_directory, private_file, safe_filename
-from .settings import Settings, normalize_drop_video_pattern
+from .settings import Settings, license_action, normalize_drop_video_pattern
 from .vault import KeyVault, normalize_hex, split_pair
 
 LineSink = Callable[[str], None]
@@ -1181,19 +1181,70 @@ class Engine:
         drm = playback.drm
         if drm is None:
             return None
+        selected = drm.context.get("license_inventory_mode") == "selected"
+        scan_marker = f"init_data_scanned_{system.id}"
+        if selected and drm.context.get(scan_marker):
+            return drm_registry.init_data_for(drm, system.id)
         self.log("Reading the playlist for DRM init data")
         text = self._fetch_text(playback, playback.manifest_url)
         if not text:
             return None
         manifest_base = playback.manifest_base_url or playback.manifest_url
         resolved: str | None = None
+        missing_media_init = False
+        if selected and system.id == WIDEVINE:
+            drm.pssh = None
+            drm.context["pssh_values"] = []
+            drm.context.pop("selected_license_pssh", None)
         for url in self._license_playlists(playback, system, tracks):
             media = self._fetch_text(playback, url)
             if media:
+                from . import playready, pssh
+
+                media_objects = (
+                    pssh.all_from_hls(media) if system.id == WIDEVINE
+                    else playready.playready_objects_from_hls(media)
+                )
+                missing_media_init |= not bool(media_objects)
                 resolved = system.extract(media, drm, self.log) or resolved
+        if selected:
+            # Exact media init data wins. A session key is a fallback, not an
+            # excuse to walk unselected variants.
+            expected = {normalize_hex(kid) for kid in drm.context.get("license_track_kids") or []} - {""}
+            missing = expected - set(self._drm_key_ids(playback))
+            if not resolved or missing:
+                if system.id == WIDEVINE:
+                    from . import pssh as pssh_tools
+
+                    values = pssh_tools.all_from_hls(text)
+                    wanted = set(drm.context.get("license_track_kids") or [])
+                    values = [value for value in values if drm_registry.widevine_kids(value) & (missing or wanted)] or (
+                        values if not resolved and len(values) == 1 else []
+                    )
+                    if values:
+                        drm.context["pssh_values"] = list(dict.fromkeys([*(drm.context.get("pssh_values") or []), *values]))
+                        drm.pssh = drm.context["pssh_values"][0]
+                        drm.context["selected_license_pssh"] = True
+                        resolved = drm.pssh
+                else:
+                    resolved = system.extract(text, drm, self.log)
+            if (
+                not resolved or expected - set(self._drm_key_ids(playback))
+                or (not expected and missing_media_init)
+            ) and tracks is not None:
+                for payload in self.fetch_init_segments(playback, tracks, collect_all=True):
+                    resolved = system.extract(payload, drm, self.log) or resolved
+            drm.context[scan_marker] = True
+            return resolved
         # the master last, so a per-track key line is what the first exchange uses
         # and the master's is the fallback - the order the legacy scripts used
         resolved = system.extract(text, drm, self.log) or resolved
+        if system.collect_init_segments and tracks is not None:
+            expected = {normalize_hex(kid) for kid in drm.context.get("license_track_kids") or []} - {""}
+            if expected - set(self._drm_key_ids(playback)) or (not expected and missing_media_init):
+                for payload in self.fetch_init_segments(playback, tracks, collect_all=True):
+                    resolved = system.extract(payload, drm, self.log) or resolved
+            drm.context[scan_marker] = True
         if resolved or "#EXT-X-STREAM-INF" not in text:
             return resolved
         append_query = "--append-url-params" in playback.extra_args
@@ -1210,12 +1261,13 @@ class Engine:
     def _license_playlists(
         self, playback: Playback, system, tracks: TrackSet | None
     ) -> list[str]:
-        """The media playlists in the parsed encrypted licence inventory.
+        """Media playlists in the explicit licence inventory.
 
-        Empty for a system whose licence answers with every key at once, because
-        then one init data is the whole title and these fetches buy nothing.
+        Before follows the system's collection policy; After follows the
+        selected encrypted inventory for both WV and PR.
         """
-        if not system.collect_init_segments or tracks is None:
+        selected = playback.drm is not None and playback.drm.context.get("license_inventory_mode") == "selected"
+        if (not system.collect_init_segments and not selected) or tracks is None:
             return []
         inventory = [stream for stream in tracks.streams if stream.encrypted]
         manifest_base = playback.manifest_base_url or playback.manifest_url
@@ -1269,13 +1321,18 @@ class Engine:
             return None
         wanted = drm.system or WIDEVINE
         system = drm_registry.get(wanted)
+        selected = drm.context.get("license_inventory_mode") == "selected"
+        if wanted == WIDEVINE and selected:
+            drm_registry.scope_widevine_init_data(drm)
         if wanted == drm_registry.PLAYREADY and drm.context.get("license_inventory_mode") == "selected":
             drm_registry.scope_playready_init_data(drm)
         existing = drm_registry.init_data_for(drm, wanted)
+        if existing and drm.context.get("license_action") == "custom":
+            return existing
         existing_headers = drm.context.get("wrm_headers") or []
         init_scan_marker = f"init_data_scanned_{wanted}"
         needs_more_headers = len(existing_headers) <= 1
-        if wanted == drm_registry.PLAYREADY and drm.context.get("license_inventory_mode") == "selected":
+        if wanted == drm_registry.PLAYREADY or selected:
             from . import playready
 
             expected = {
@@ -1288,18 +1345,26 @@ class Engine:
         needs_playready_collection = bool(
             existing
             and system is not None
-            and system.collect_init_segments
+            and (system.collect_init_segments or selected)
             and tracks is not None
             and needs_more_headers
             and not drm.context.get(init_scan_marker)
         )
+        hls_inventory = tracks is not None and any(
+            stream.encrypted and stream.manifest_type == "hls" for stream in tracks.streams
+        )
+        hls_source = bool(playback.manifest_url and (_looks_like_hls(playback.manifest_url) or hls_inventory))
+        if (
+            selected or (system is not None and system.collect_init_segments and hls_source)
+        ) and tracks is not None and not drm.context.get(init_scan_marker):
+            needs_playready_collection = True
         if existing and not needs_playready_collection:
             return existing
         if system is None or system.extract is None:
             return existing
         if not playback.inline_manifest and not playback.manifest_url:
             return None
-        if playback.manifest_url and _looks_like_hls(playback.manifest_url):
+        if hls_source:
             # HLS does carry init data, in an EXT-X-KEY/EXT-X-SESSION-KEY attribute
             # rather than in XML. Skipping the fetch here is what made Disney+ report
             # "no PSSH found in the manifest" about a playlist that announces one.
@@ -1321,14 +1386,16 @@ class Engine:
 
         resolved = system.extract(manifest, drm, self.log)
         missing_selected_headers = False
-        if wanted == drm_registry.PLAYREADY and drm.context.get("license_inventory_mode") == "selected":
+        if wanted == drm_registry.PLAYREADY or selected:
+            from . import playready
+
             expected = {
                 playready.canonical_kid(str(kid))
                 for kid in drm.context.get("license_track_kids") or []
             } - {""}
             missing_selected_headers = bool(expected - set(self._drm_key_ids(playback)))
         if (resolved and not missing_selected_headers) or tracks is None:
-            if resolved and system.collect_init_segments:
+            if resolved and (system.collect_init_segments or selected):
                 drm.context[init_scan_marker] = True
             return resolved
 
@@ -1339,16 +1406,16 @@ class Engine:
             init_payloads = self.fetch_init_segments(
                 playback,
                 tracks,
-                collect_all=system.collect_init_segments,
+                collect_all=system.collect_init_segments or selected,
             )
             for init_data in init_payloads:
                 resolved = system.extract(init_data, drm, self.log)
                 if resolved:
                     init_result = resolved
-                    if not system.collect_init_segments:
+                    if not system.collect_init_segments and not selected:
                         return resolved
         finally:
-            if system.collect_init_segments:
+            if system.collect_init_segments or selected:
                 # A second vault check in the same delivery must not fetch the
                 # same MPD and init resources again. New playback contexts get a
                 # fresh marker, so this does not suppress a later authorization.
@@ -1360,7 +1427,10 @@ class Engine:
         if wanted == WIDEVINE:
             from . import pssh as pssh_tools
 
-            key_ids = pssh_tools.key_ids_from_mpd(manifest)
+            key_ids = (
+                self.downloader.key_ids([stream for stream in tracks.streams if stream.encrypted])
+                if selected else pssh_tools.key_ids_from_mpd(manifest)
+            )
             if not key_ids:
                 key_ids = self.downloader.key_ids(
                     [stream for stream in tracks.streams if stream.encrypted]
@@ -1372,6 +1442,9 @@ class Engine:
             fallback = pssh_tools.from_key_ids(key_ids)
             if fallback:
                 drm.pssh = fallback
+                if selected:
+                    drm.context["pssh_values"] = [fallback]
+                    drm.context["selected_license_pssh"] = True
                 self.log("Widevine: built a KID-only fallback PSSH")
                 return fallback
         if init_payloads:
@@ -1384,7 +1457,7 @@ class Engine:
                 self._mark_tracks_clear(tracks)
                 self.log("DRM metadata absent and init segment is clear; skipping license")
                 return None
-        return None
+        return resolved
 
 
     @staticmethod
@@ -1491,7 +1564,9 @@ class Engine:
         if drm.system == drm_registry.PLAYREADY:
             from . import playready
 
-            for header in drm.context.get("wrm_headers") or []:
+            for header in [drm.wrm_header, *(drm.context.get("wrm_headers") or [])]:
+                if not header:
+                    continue
                 for kid in playready.key_ids_from_header(str(header)):
                     add(kid)
         elif drm.system == WIDEVINE:
@@ -1585,7 +1660,7 @@ class Engine:
             if not selected_only or playback.drm.context.get("selected_license_pssh")
             else []
         )
-        if selected_only and inventory_kids and playback.drm.system == drm_registry.PLAYREADY:
+        if selected_only and inventory_kids:
             # A selected header may legitimately carry multiple KIDs. Its
             # unselected keys do not expand this download's vault requirement.
             wanted_kids = {normalize_hex(value) for value in inventory_kids}
@@ -2028,11 +2103,11 @@ class Engine:
         license_tracks: TrackSet | None = None,
     ) -> list[str]:
         """Run whichever DRM path the service declared, vault first."""
-        # ``tracks.selected`` normally belongs only to output selection.  The
-        # optional explicit inventory is the one deliberate compatibility mode
-        # where a service asks us to license only the media playlists the user
-        # confirmed (HLS services can hide init data in child playlists).  Keeping
-        # this keyword opt-in preserves the long-standing full-manifest behavior.
+        # The explicit inventory or After policy scopes licensing to final
+        # encrypted output tracks. Before retains the full inventory; Custom
+        # leaves the request plan to an explicitly supporting service.
+        if license_tracks is None and tracks is not None and license_action(settings, service) == "after":
+            license_tracks = self.license_inventory(tracks, selected_only=True)
         inventory_tracks = (
             license_tracks
             if license_tracks is not None
@@ -2069,6 +2144,13 @@ class Engine:
             # Clear playbacks and raw HLS keys do not enter either the
             # service-owned or Core-owned licence paths.
             return []
+        if license_tracks is not None and not license_tracks.selected:
+            return []
+        action = "after" if license_tracks is not None else license_action(settings, service)
+        drm.context["license_action"] = action
+        declared_custom = bool(getattr(service, "CUSTOM_LICENSE", False))
+        if action == "custom":
+            drm.context["license_final_tracks"] = list(tracks.selected) if tracks is not None else []
 
         # This is a DRM-only inventory. It is deliberately derived from the full
         # parsed ladder and never from ``TrackSet.selected``, which belongs solely
@@ -2086,18 +2168,21 @@ class Engine:
             drm.context["license_track_kids"] = list(
                 dict.fromkeys([*known_kids, *self.downloader.key_ids(inventory)])
             )
-            if drm.system == drm_registry.PLAYREADY:
+            if drm.system in {drm_registry.PLAYREADY, WIDEVINE}:
                 scope = (
                     drm.context["license_inventory_mode"],
                     tuple(id(stream) for stream in inventory),
                     tuple(drm.context["license_track_kids"]),
                 )
-                previous = drm.context.get("playready_init_scope")
+                scope_key = f"{drm.system}_init_scope"
+                previous = drm.context.get(scope_key)
                 if previous != scope:
-                    drm.context.pop("init_data_scanned_playready", None)
+                    drm.context.pop(f"init_data_scanned_{drm.system}", None)
                     if previous is not None:
                         drm.context.pop("selected_license_pssh", None)
-                    drm.context["playready_init_scope"] = scope
+                    drm.context[scope_key] = scope
+                if drm.system == WIDEVINE and license_tracks is not None:
+                    drm_registry.scope_widevine_init_data(drm)
 
         if service.USES.is_self("drm"):
             # A foreign export is a completed delivery handoff, not a service
@@ -2192,8 +2277,13 @@ class Engine:
         system = drm_registry.require(drm.system)
         if inventory_tracks is not None:
             prepare = getattr(service, "prepare_drm", None)
-            if callable(prepare):
+            if callable(prepare) and (not declared_custom or action == "custom"):
                 prepare(playback, inventory_tracks, self.log)
+            if declared_custom and action == "custom":
+                custom_kids = self._drm_key_ids(playback)
+                if custom_kids:
+                    drm.context["license_track_kids"] = custom_kids
+                drm.context["license_inventory_mode"] = "custom"
         if inventory_tracks is not None:
             cached = self.vault_lookup(playback, inventory_tracks, service, settings)
             # A cache hit is only provisional until init data has been scanned.
@@ -2229,7 +2319,12 @@ class Engine:
         # "licence request" would be a lie for a system that does not make one
         what = "license request" if system.networked else "local ticket"
         self.log(f"{system.label} {what} ({where})")
-        fresh_keys = list(service.resolve_keys(playback, log=self.log) or [])
+        if declared_custom and action != "custom":
+            from .service import Service
+
+            fresh_keys = list(Service.resolve_keys(service, playback, log=self.log) or [])
+        else:
+            fresh_keys = list(service.resolve_keys(playback, log=self.log) or [])
         cached_keys = playback.drm.context.get("vault_keys") or []
         playback.keys = (
             self._merge_key_pairs(cached_keys, fresh_keys)

@@ -526,11 +526,11 @@ class SettingsScreen(Screen):
             scope = self.service.settings
             service_note = tr("settings.note.this_service")
             policy_keys = {
-                        "license_after_tracks", "dolby_vision_hybrid", "local_vault", "remote_vault",
+                        "license_action", "license_after_tracks", "dolby_vision_hybrid", "local_vault", "remote_vault",
                 "remote_vault_auto_lookup", "remote_vault_auto_store",
                 "vault_read_targets", "vault_write_targets",
             }
-            declared_keys = {spec.key for spec in type(self.service).SETTINGS}
+            declared_keys = {spec.key for spec in getattr(type(self.service), "SETTINGS", ())}
             add_section(
                 self.service.NAME,
                 [
@@ -546,7 +546,7 @@ class SettingsScreen(Screen):
                 [
                     spec for spec in scope.specs
                     if spec.key in {
-                        "license_after_tracks",
+                        "license_action",
                         "dolby_vision_hybrid",
                         "local_vault",
                         "remote_vault",
@@ -625,7 +625,12 @@ class SettingsScreen(Screen):
         row = f"[$accent]{visual_markup(value)}[/]"
         if spec.inherit_global and scope.parent is not None:
             source = "settings.service_override" if scope.has_override(spec.key) else "settings.follows_global"
-            row += f"  [$dim]{tr(source)}[/]"
+            service_default = (
+                spec.key == "license_action" and spec.default == "custom"
+                and not scope.has_override(spec.key) and not scope.parent.has_override(spec.key)
+            )
+            if not service_default:
+                row += f"  [$dim]{tr(source)}[/]"
         if spec.resets_session:
             row += f"  [$dim]{tr('settings.signs_out')}[/]"
         return setting_row(

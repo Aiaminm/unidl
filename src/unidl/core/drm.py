@@ -115,14 +115,8 @@ class DrmSystem:
     make_challenge: ChallengeMaker | None = None
     #: does obtaining a key involve a licence server?
     networked: bool = True
-    #: this system's init data is per key id, not per title, so every place one can
-    #: hide is worth reading. Widevine repeats the same PSSH everywhere and its
-    #: licence answers with every key, so the first one found is the whole story;
-    #: PlayReady may put a different object - and therefore a different key - in
-    #: each representation, and one exchange only answers for the header it was made
-    #: with. Two readers act on this: the init-segment scan collects every distinct
-    #: representation instead of stopping at the first, and the HLS reader also
-    #: fetches media playlists from the encrypted licence inventory.
+    #: Collect per-key init data in Before mode (PlayReady). After mode collects
+    #: exact selected init data for both WV and PR regardless of this default.
     collect_init_segments: bool = False
     help: str = ""
     install_hint: str = ""
@@ -486,24 +480,100 @@ def discover(roots: Iterable[Path]) -> list[DeviceFile]:
 def _widevine_keys(exchange: Exchange) -> list[str]:
     from . import cdm
 
-    return cdm.get_keys(
+    return _collect_widevine_keys(exchange, lambda init_data: cdm.get_keys(
         exchange.device,
-        exchange.init_data,
+        init_data,
         lambda challenge: exchange.service.get_license(challenge, exchange.drm),
         service_certificate=exchange.drm.service_certificate,
-    )
+    ))
 
 
 def _widevine_remote_keys(exchange: Exchange) -> list[str]:
     from . import remotecdm
 
-    return remotecdm.widevine_keys(
+    return _collect_widevine_keys(exchange, lambda init_data: remotecdm.widevine_keys(
         exchange.remote,
-        exchange.init_data,
+        init_data,
         lambda challenge: exchange.service.get_license(challenge, exchange.drm),
         certificate=exchange.drm.service_certificate,
         log=exchange.log,
-    )
+    ))
+
+
+def widevine_kids(value: str) -> set[str]:
+    try:
+        from pywidevine.pssh import PSSH
+
+        return {kid.hex for kid in PSSH(value).key_ids}
+    except Exception:
+        return set()
+
+
+def scope_widevine_init_data(drm: DrmInfo) -> None:
+    """Keep original PSSH bytes; discard unproven full-ladder seeds."""
+    if drm.context.get("license_inventory_mode") != "selected":
+        return
+    from .vault import normalize_hex
+
+    wanted = {normalize_hex(kid) for kid in drm.context.get("license_track_kids") or []} - {""}
+    trusted = drm.context.get("selected_license_pssh")
+    values = [
+        value for value in _distinct([drm.pssh, *(drm.context.get("pssh_values") or [])])
+        if (widevine_kids(value) & wanted) or (trusted and (not wanted or not widevine_kids(value)))
+    ]
+    drm.pssh = values[0] if values else None
+    drm.context["pssh_values"] = values
+
+
+def _collect_widevine_keys(exchange: Exchange, get_one: Callable[[str], list[str]]) -> list[str]:
+    """One unchanged PSSH per exchange; stop when selected coverage is complete."""
+    if exchange.drm.context.get("license_inventory_mode") != "selected":
+        return get_one(exchange.init_data)
+    from .vault import normalize_hex, split_pair
+
+    scope_widevine_init_data(exchange.drm)
+    values = _distinct([exchange.drm.pssh, *(exchange.drm.context.get("pssh_values") or [])])
+    wanted = {normalize_hex(kid) for kid in exchange.drm.context.get("license_track_kids") or []} - {""}
+    coverage_known = bool(wanted) or all(widevine_kids(value) for value in values)
+    if not wanted:
+        wanted = set().union(*(widevine_kids(value) for value in values))
+    keys = {}
+    for value in exchange.drm.context.get("vault_keys") or []:
+        pair = split_pair(str(value))
+        if pair:
+            keys.setdefault(*pair)
+    original = exchange.drm.pssh
+    failures = []
+    try:
+        for index, value in enumerate(values, 1):
+            if coverage_known and wanted and wanted <= keys.keys():
+                break
+            kids = widevine_kids(value)
+            if kids and kids <= keys.keys():
+                continue
+            exchange.drm.pssh = value
+            try:
+                current = get_one(value)
+            except FatalLicenseError:
+                raise
+            except Exception as exc:
+                failures.append(exc)
+                if any(word in str(exc).lower() for word in _THROTTLED):
+                    raise
+                exchange.log(f"Widevine: licence {index}/{len(values)} failed ({str(exc)[:160]})")
+                continue
+            for entry in current or []:
+                pair = split_pair(str(entry))
+                if pair:
+                    keys.setdefault(*pair)
+            exchange.log(f"Widevine: licence {index}/{len(values)} returned {len(current or [])} key(s)")
+    finally:
+        exchange.drm.pssh = original
+    if wanted - keys.keys():
+        raise CdmError("Widevine license did not cover every selected encrypted track")
+    if not keys:
+        raise CdmError(f"No Widevine PSSH was accepted: {failures[-1] if failures else 'no content keys'}")
+    return [f"{kid}:{key}" for kid, key in keys.items()]
 
 
 def _widevine_challenge(exchange: Exchange) -> bytes:
@@ -531,6 +601,26 @@ def _widevine_challenge(exchange: Exchange) -> bytes:
 def _widevine_extract(manifest: bytes | str, drm: DrmInfo, log) -> str | None:
     from . import pssh as pssh_tools
 
+    if drm.context.get("license_inventory_mode") == "selected":
+        from . import playready
+
+        scoped = playready.dash_manifest_for_tracks(manifest, drm.context.get("license_tracks") or [])
+        if scoped is not None:
+            manifest = scoped
+        scope_widevine_init_data(drm)
+        values = pssh_tools.all_from_mpd(manifest) or pssh_tools.all_from_hls(manifest)
+        if not values and isinstance(manifest, bytes):
+            values = pssh_tools.from_init_segment(manifest)
+        wanted = set(drm.context.get("license_track_kids") or [])
+        if wanted:
+            values = [value for value in values if not widevine_kids(value) or widevine_kids(value) & wanted]
+        if values:
+            if not drm.context.get("selected_license_pssh"):
+                drm.context["pssh_values"] = []
+            drm.context["pssh_values"] = _distinct([*(drm.context.get("pssh_values") or []), *values])
+            drm.pssh = drm.context["pssh_values"][0]
+            drm.context["selected_license_pssh"] = True
+        return drm.pssh
     drm.pssh = pssh_tools.from_mpd(manifest)
     if not drm.pssh:
         # HLS keeps the same PSSH in an EXT-X-KEY attribute rather than in XML, so

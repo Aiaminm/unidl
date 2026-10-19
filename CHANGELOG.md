@@ -1,5 +1,27 @@
 # Changelog
 
+## [2.4.4] - 2026-10-19
+
+### License policy
+
+- Added an explicit License action choice for Before, After and service-declared Custom workflows, preserving legacy settings and global/service override precedence.
+- Scoped post-selection licensing to selected encrypted tracks across DASH, HLS and ISM, improved distinct Widevine PSSH coverage and PlayReady representation matching, and kept license transport service-owned.
+- Added explicit Custom-license declarations for compiled service manifests without inferring support from filenames or hook overrides.
+
+### Back navigation
+
+- Forwarded answers and navigation exceptions through shared search flows so Back restored the immediate parent page and closed child flows correctly.
+- Documented one-level return behavior for results, failures, batches and overlays.
+
+### Track languages
+
+- Displayed full language names with explicit country or region names using offline data, while preserving original tags and filtering behavior.
+- Added additive original-language audio and subtitle selection, including mixed rules such as original,en without duplicate language-group selection.
+
+### Interface language
+
+- Added German (Deutsch), including regional system-locale aliases, settings labels and application messages.
+
 ## [2.4.3] - 2026-10-17
 
 ### Track information

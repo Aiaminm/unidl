@@ -101,27 +101,34 @@ class StreamInfo:
         return "Med"
 
     def format_line(self, index: int | None = None, *, include_region: bool = True) -> str:
+        """Describe a track; filters can omit computed language/region labels."""
         from .utils import (
             compact_join,
             format_bitrate,
             format_frame_rate,
             format_size,
             format_time,
+            language_name,
             pretty_codec,
-            track_region_name,
+            track_language_label,
         )
 
         prefix = self.display_prefix()
         if self.encrypted:
             prefix = f"{prefix} *{self.encryption_scheme or 'ENC'}"
 
-        region_name = (
-            track_region_name(
+        language_label = (
+            track_language_label(
                 self.language, self.extra.get("audioTrackId"), self.group_id, self.id, self.name,
             )
             if include_region and self.media_type in {"audio", "subtitle", "subtitles", "text"}
             else None
         )
+        provider_name = self.name
+        if language_label and str(provider_name or "").strip().casefold() in {
+            language_label.casefold(), str(language_name(self.language) or "").casefold(),
+        }:
+            provider_name = None
         descriptor = self.role or (self.name if self.media_type == "video" else None)
         common_tail: list[str | None] = [
             self.segment_summary(),
@@ -142,7 +149,7 @@ class StreamInfo:
                 and self.group_id.lower() in self.id.lower()
             ):
                 display_id = self.id
-            display_name = self.name if self.name not in {display_id, self.group_id, self.id} else None
+            display_name = provider_name if provider_name not in {display_id, self.group_id, self.id} else None
             codec_label = pretty_codec(self.codecs, self.media_type)
             if self.extra.get("audio_atmos") and codec_label in {"AC-3", "E-AC-3"}:
                 codec_label = "E-AC-3 Atmos"
@@ -152,18 +159,18 @@ class StreamInfo:
                 display_name,
                 codec_label,
                 self.language,
-                region_name,
+                language_label,
                 f"{self.channels}CH" if self.channels else None,
                 *common_tail,
             ]
         elif self.media_type in {"subtitle", "subtitles", "text"}:
-            display_name = self.name if self.name not in {self.group_id, self.id} else None
+            display_name = provider_name if provider_name not in {self.group_id, self.id} else None
             subtitle_kind = _subtitle_kind_label(self)
             descriptor_text = str(descriptor or "").casefold()
             parts = [
                 self.group_id or self.id,
                 self.language,
-                region_name,
+                language_label,
                 display_name,
                 pretty_codec(self.codecs, self.media_type),
                 *common_tail,

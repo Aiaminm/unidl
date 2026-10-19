@@ -307,20 +307,37 @@ ctx.error("playback denied")
 
 ### Back
 
-`Back` is thrown into your generator when the user goes up a level. Catch it to
-handle a level yourself, or let it propagate:
+`Back` means the immediate previous page, not a shortcut to service home.
+The same rule applies after successful or failed downloads, saved commands and
+exports. Keep each parent picker/input alive and delegate children with
+`yield from` so their Back handlers can run:
 
 ```python
-while True:
-    try:
-        season = yield ctx.pick("Season", seasons)
-    except Back:
-        return                      # leave this sub-flow
-    episodes = yield ctx.pick(f"Season {season}", ...)
+def browse_seasons(ctx, seasons):
+    page = ctx.pick("Season", seasons)
+    while True:
+        season = yield page
+        try:
+            yield from browse_episodes(ctx, season)
+        except Back:
+            continue                # child → season picker, not service home
+        except RuntimeError as exc:
+            ctx.problem("Could not load that season", str(exc))
+            continue                # same parent after a recoverable failure
+        if not ctx.interactive:
+            return
 ```
 
-You do not need to catch it at your top level — `Service.home()` already
-catches `Back` from sub-flows and redisplays its menu.
+Back on the season picker itself escapes to its real parent, such as search
+results. Do not catch a deeper child's Back only at `home()`, because that skips
+the intervening pages. Shared `Service.home()` catches Back only after the
+relevant inner flow has had the chance to handle it; returning to its menu is
+correct only when that menu is the actual preceding page.
+
+The shared search counter forwards both answers and exceptions. Existing custom
+home flows and navigation overrides remain valid and do not receive an extra
+Back. See [navigation.md](navigation.md) for the complete return contract,
+batch/error behavior, state retention and verification checklist.
 
 ## Playback and DRM
 
@@ -419,6 +436,31 @@ call `super().get_license(...)` or `super().get_license_soap(...)`.
 For Widevine privacy mode, fetch the service certificate before emitting the
 playback and put its decoded bytes in `service_certificate`. Core applies it
 before creating the challenge for both local and remote CDMs.
+
+### Declaring Custom license
+
+Set `CUSTOM_LICENSE = True` on the Service class to expose the Custom option in
+**License action**. Do not infer this capability from a filename, a service ID
+or the mere presence of a hook. Source-free packages can instead explicitly set
+`custom_license = true` in their root `service.toml`.
+
+In Custom mode, `prepare_drm(playback, tracks, log)` chooses the service-owned
+plan before vault lookup; `resolve_keys` may organize service-specific exchanges.
+Populate the actual `drm.pssh` / `pssh_values` or `wrm_header` / `wrm_headers`.
+Their KIDs define the custom vault coverage when available. If opaque init data
+does not expose KIDs, set `license_track_kids` to the actual plan explicitly.
+Neither hook may borrow shared output preferences to change provider endpoints.
+Override `custom_license_after_tracks(playback)` to return True only if your
+Custom workflow must wait for the final picker; otherwise it runs beforehand.
+Custom receives the full inventory and owns how it uses its final selection,
+available as `drm.context["license_final_tracks"]` when deferred.
+
+Selecting standard Before/After bypasses an explicitly declared Custom planner
+and custom `resolve_keys` override. Core still calls your own `get_license` /
+`get_license_soap` transport. Before uses the default WV seed or full PR
+inventory; After uses final selected encrypted tracks on DASH/HLS/ISM. Existing
+undeclared service hooks remain compatible, but must respect the supplied
+inventory; new custom plans must declare support. MonaLisa is unchanged.
 
 If the verified client chooses its licence seed independently of the tracks that
 will be downloaded, override `prepare_drm(playback, tracks, log)`. It runs on the
@@ -601,7 +643,7 @@ origin for every merged stream and groups the final licence inventory by that
 origin. A service-owned `resolve_keys` implementation must therefore keep each
 profile's licence context, endpoint and session separate, request every needed
 profile/PSSH once, and return the union of the resulting keys. When
-`license_after_tracks` is enabled, narrow that work to the origins and encrypted
+`license_action=after` is selected, narrow that work to the origins and encrypted
 tracks represented by the final selection; do not use the full profile list just
 because it was requested earlier. Clear duplicate `playback.keys`/cached-key
 state between independent exchanges so one successful profile cannot suppress
@@ -657,20 +699,24 @@ rules and tests are in
 
 ## Failing
 
-Raise. Do not catch your own error just to return quietly, and do not print.
+Raise an actionable service error. Do not print or silently return on a failure.
+Catch expected child failures at their closest owning picker/input so the user
+can retry or go back one page. Do not let an ordinary child failure unwind every
+parent to service home; see [navigation.md](navigation.md).
 
 What happens next depends on the type, and the line is between *the situation is
 wrong* and *this code is wrong*:
 
 | You raise | The session |
 |-----------|-------------|
-| any `RuntimeError` - which every service error class in this tree is | shows a panel and returns to your menu; the rest of the session is untouched |
+| any `RuntimeError` - which every service error class in this tree is | the closest owning page should report it and remain available; an uncaught error reaching `Service.home()` uses its menu as a last-resort safety boundary |
 | anything else - `TypeError`, `AttributeError`, `KeyError` | ends, with a panel and a traceback in debug mode |
 
 So an expired login, a licence the CDM was refused, an episode this region does not
-carry: raise your own error and say what a person can do about it. The advice is
-worth writing because the menu is where they end up, so "sign in again from this
-service's menu" can actually be followed.
+carry: raise your own error and say what a person can do about it. Keep the
+immediate parent page live while reporting the error. Advice such as "sign in
+again from this service's menu" is useful, but is not a reason to jump there;
+the user can reach it by backing out one level at a time.
 
 A `TypeError` is a bug, and it stays loud on purpose. Catching it behind a friendly
 menu is how a bug becomes a mystery.

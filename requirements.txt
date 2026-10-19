@@ -13,6 +13,7 @@ httpx[http2,socks]>=0.27
 cryptography>=42
 PyYAML>=6.0
 geonamescache>=2.0
+pycountry>=24.6.1
 pycryptodome>=3.20
 python-bidi>=0.6
 arabic-reshaper>=3.0

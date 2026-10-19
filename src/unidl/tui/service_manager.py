@@ -444,7 +444,7 @@ class ServicesManagerScreen(Screen[None]):
             ("chapters", tr('service.chapters.action', default='Chapter metadata by service'), f"[$dim]{tr('service.chapters.summary', default='Independent on/off per registered service')}[/]"),
             ("attachments", tr('service.attachments.action', default='Title attachments by service'), f"[$dim]{tr('service.attachments.summary', default='Independent on/off per registered service')}[/]"),
             ("bitrate", tr("service.bitrate.action"), f"[$dim]{tr('service.bitrate.summary')}[/]"),
-            ("license", tr('service.license.action', default='License after final track selection'), f"[$dim]{setting_value(self.globals.spec_by_key['license_after_tracks'], self.globals)}[/]"),
+            ("license", tr('service.license.action', default='License action (global)'), f"[$dim]{setting_value(self.globals.spec_by_key['license_action'], self.globals)}[/]"),
             ("hybrid", tr('service.hybrid.action', default='Dolby Vision + HDR10 hybrid output'), f"[$dim]{setting_value(self.globals.spec_by_key['dolby_vision_hybrid'], self.globals)}[/]"),
             ("register", tr('service.register.action'), f"[$dim]{tr('service.register.summary', registered=count, available=len(self._sources))}[/]"),
             ("home", tr('service.home.action'), f"[$dim]{tr('service.home.summary', shown=shown, registered=count)}[/]"),
@@ -495,14 +495,16 @@ class ServicesManagerScreen(Screen[None]):
             self.app.push_screen(_BitratePolicyScreen(self.app), lambda _result: self.rebuild())
             return
         if ident == "license":
-            spec = self.globals.spec_by_key["license_after_tracks"]
-            self.globals.set("license_after_tracks", not bool(self.globals.get("license_after_tracks")))
-            self.app.notify(
-                tr("settings.changed", label=setting_label(spec),
-                   value=setting_value(spec, self.globals)),
-                timeout=4,
-            )
-            self.rebuild()
+            from .settings_screen import _ChoiceEditor
+
+            spec = self.globals.spec_by_key["license_action"]
+
+            def license_done(value) -> None:
+                if value is not None:
+                    self.globals.set(spec.key, value)
+                    self.rebuild()
+
+            self.app.push_screen(_ChoiceEditor(spec, self.globals.get(spec.key)), license_done)
             return
         if ident == "hybrid":
             spec = self.globals.spec_by_key["dolby_vision_hybrid"]
