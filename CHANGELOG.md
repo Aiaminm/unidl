@@ -1,5 +1,12 @@
 # Changelog
 
+## [2.4.5] - 2026-10-19
+
+### KID extraction
+
+- Ignored all-zero placeholder KIDs in protected MP4 initialization metadata so they no longer created an extra content-key requirement.
+- Preserved validation and errors for genuinely missing content keys.
+
 ## [2.4.4] - 2026-10-19
 
 ### License policy

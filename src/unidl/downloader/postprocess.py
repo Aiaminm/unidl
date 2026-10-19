@@ -601,7 +601,8 @@ def mp4_protected_tenc_default_kids_from_bytes(data: bytes | bytearray) -> list[
         if not parsed or not parsed[0]:
             continue
         _is_protected, kid, _relative = parsed
-        if kid not in kids:
+        # A null default KID is a placeholder; playlist/sample-group KIDs apply.
+        if kid != "0" * 32 and kid not in kids:
             kids.append(kid)
     return kids
 
